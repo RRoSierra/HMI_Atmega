@@ -57,6 +57,9 @@
 // Intervalo de request de telemetría al Slave
 #define SLAVE_REQ_MS    10     // 100 Hz
 
+// Keepalive: re-envío periódico de actuación al Slave
+#define SLAVE_KEEPALIVE_MS 30  // 20 Hz
+
 // ESC
 #define ESC_NEUTRAL     1500
 
@@ -110,6 +113,9 @@ static int16_t  slaveRPM      = 0;
 static uint16_t slaveHz100    = 0;
 static int16_t  slavePWM      = 0;
 static uint16_t slaveESC      = ESC_NEUTRAL;
+
+// --- Keepalive: último valor comandado al Slave ---
+static int16_t  slaveCmdDC    = 0;
 
 // --- Objetos ---
 static Servo esc;
@@ -498,6 +504,7 @@ static void processCommand(uint8_t cmd, int16_t val) {
     switch (cmd) {
         case SPI_CMD_DC_BOTH:
             motorSetPWM(val);
+            slaveCmdDC = val;         // Guardar para keepalive
             uartSendDC(val);          // Reenviar al Slave
             break;
 
@@ -519,6 +526,7 @@ static void processCommand(uint8_t cmd, int16_t val) {
         case SPI_CMD_STOP_ALL:
             motorSetPWM(0);
             escStop();
+            slaveCmdDC = 0;           // Limpiar keepalive
             uartSendStop();
             break;
 
@@ -587,6 +595,7 @@ void setup() {
 // ============================================================================
 static unsigned long lastTelemSend  = 0;
 static unsigned long lastSlaveReq   = 0;
+static unsigned long lastKeepalive  = 0;
 
 void loop() {
     // 1. Sensores (siempre, ambos roles)
@@ -606,6 +615,12 @@ void loop() {
         if ((now - lastSlaveReq) >= SLAVE_REQ_MS) {
             lastSlaveReq = now;
             uartRequestSlaveTelem();
+        }
+
+        // 3b. Keepalive: re-enviar actuación DC al Slave
+        if ((now - lastKeepalive) >= SLAVE_KEEPALIVE_MS) {
+            lastKeepalive = now;
+            uartSendDC(slaveCmdDC);
         }
 
         // 4. Enviar TelemetryPacket al ESP32
