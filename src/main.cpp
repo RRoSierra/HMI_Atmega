@@ -2,7 +2,7 @@
  * @file main.cpp
  * @brief ATmega328P DAQ — Banco de Identificación de Sistemas
  * @author Atacama Dynamics
- * @version 4.1.0 — UART Watchdog Fix + Signed RPM
+ * @version 5.0.0 — Selector de Modo DC/AC + Keepalive
  *
  * Firmware unificado Master/Slave (ROLE_PIN PD7).
  * Cero FSM, cero PID, cero JSON. Solo DAQ + escalones.
@@ -40,7 +40,8 @@
 #define MOTOR_GEAR_RATIO  370
 #define MOTOR_ENCODER_PPR 11
 #define ENCODER_PPR_WHEEL ((long)MOTOR_ENCODER_PPR * (long)MOTOR_GEAR_RATIO)
-#define ENCODER_UPDATE_MS 10   // 100 Hz cálculo RPM
+#define ENCODER_UPDATE_MS_NORMAL 10  // 100 Hz (modo compartido)
+#define ENCODER_UPDATE_MS_FAST   2   // 500 Hz (modo DC exclusivo)
 
 // AS5600 (BLDC)
 #define BLDC_POLL_MS    2      // 500 Hz I2C polling
@@ -72,6 +73,8 @@
 #define SPI_CMD_AC_SLAVE    0x73
 #define SPI_CMD_AC_BOTH     0x75
 #define SPI_CMD_STOP_ALL    0x76
+#define SPI_CMD_MODE_DC     0x77
+#define SPI_CMD_MODE_AC     0x78
 
 // ============================================================================
 // PROTOCOLO UART: MASTER ↔ SLAVE
@@ -81,6 +84,8 @@
 #define UART_CMD_STOP       0x7C  // sin payload
 #define UART_CMD_REQ_TELEM  0x7D  // sin payload → Slave responde 8 bytes
 #define UART_RSP_TELEM      0x7E  // + 8 bytes LE (RPM, Hz100, PWM, ESC)
+#define UART_CMD_MODE_DC    0x8A  // sin payload
+#define UART_CMD_MODE_AC    0x8B  // sin payload
 
 // ============================================================================
 // PAQUETE DE TELEMETRÍA (22 bytes, enviado por SPI al ESP32)
@@ -103,6 +108,10 @@ struct __attribute__((packed)) TelemetryPacket {
 // VARIABLES GLOBALES
 // ============================================================================
 static bool isMaster = false;
+
+// --- Modo de prueba ---
+enum TestMode { MODE_DC, MODE_AC };
+static TestMode currentMode = MODE_DC;
 
 // --- Estado de actuación local ---
 static int16_t  appliedPWM = 0;      // PWM aplicado al DC local
@@ -159,7 +168,8 @@ static void encoderInit() {
 
 static void encoderUpdate() {
     unsigned long now = millis();
-    if ((now - encLastTime) < ENCODER_UPDATE_MS) return;
+    uint8_t interval = (currentMode == MODE_DC) ? ENCODER_UPDATE_MS_FAST : ENCODER_UPDATE_MS_NORMAL;
+    if ((now - encLastTime) < interval) return;
 
     noInterrupts();
     long cur = encPulses;
@@ -416,6 +426,16 @@ static void uartPoll() {
                         uartRxVal = 0;
                         uartRxReady = true;
                         break;
+                    case UART_CMD_MODE_DC:
+                        uartRxCmd = UART_CMD_MODE_DC;
+                        uartRxVal = 0;
+                        uartRxReady = true;
+                        break;
+                    case UART_CMD_MODE_AC:
+                        uartRxCmd = UART_CMD_MODE_AC;
+                        uartRxVal = 0;
+                        uartRxReady = true;
+                        break;
                     case UART_CMD_REQ_TELEM:
                         // Slave responde inmediatamente con sus datos
                         {
@@ -456,6 +476,10 @@ static void uartSendAC(uint16_t us) {
 
 static void uartSendStop() {
     Serial.write(UART_CMD_STOP);
+}
+
+static void uartSendMode(TestMode mode) {
+    Serial.write(mode == MODE_DC ? UART_CMD_MODE_DC : UART_CMD_MODE_AC);
 }
 
 static void uartRequestSlaveTelem() {
@@ -530,6 +554,24 @@ static void processCommand(uint8_t cmd, int16_t val) {
             uartSendStop();
             break;
 
+        case SPI_CMD_MODE_DC:
+            motorSetPWM(0);
+            escStop();
+            slaveCmdDC = 0;
+            currentMode = MODE_DC;
+            uartSendStop();
+            uartSendMode(MODE_DC);
+            break;
+
+        case SPI_CMD_MODE_AC:
+            motorSetPWM(0);
+            escStop();
+            slaveCmdDC = 0;
+            currentMode = MODE_AC;
+            uartSendStop();
+            uartSendMode(MODE_AC);
+            break;
+
         default:
             break;
     }
@@ -559,6 +601,18 @@ static void slaveProcessCommand() {
         case UART_CMD_STOP:
             motorSetPWM(0);
             escStop();
+            break;
+
+        case UART_CMD_MODE_DC:
+            motorSetPWM(0);
+            escStop();
+            currentMode = MODE_DC;
+            break;
+
+        case UART_CMD_MODE_AC:
+            motorSetPWM(0);
+            escStop();
+            currentMode = MODE_AC;
             break;
 
         default:
@@ -598,9 +652,12 @@ static unsigned long lastSlaveReq   = 0;
 static unsigned long lastKeepalive  = 0;
 
 void loop() {
-    // 1. Sensores (siempre, ambos roles)
-    encoderUpdate();
-    bldcUpdate();
+    // 1. Sensores (exclusivos según modo)
+    if (currentMode == MODE_DC) {
+        encoderUpdate();
+    } else {
+        bldcUpdate();
+    }
 
     // 2. UART (siempre)
     uartPoll();
@@ -634,9 +691,9 @@ void loop() {
             pkt.sPWM_applied = slavePWM;
             pkt.mESC_applied = appliedESC;
             pkt.sESC_applied = slaveESC;
-            pkt.mRPM         = encoderGetRPM();
+            pkt.mRPM         = (currentMode == MODE_DC) ? encoderGetRPM() : 0;
             pkt.sRPM         = slaveRPM;
-            pkt.mHz          = bldcGetHz100();
+            pkt.mHz          = (currentMode == MODE_AC) ? bldcGetHz100() : 0;
             pkt.sHz          = slaveHz100;
 
             spiTransact(&pkt);
