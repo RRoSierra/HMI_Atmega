@@ -2,7 +2,7 @@
  * @file main.cpp
  * @brief ATmega328P DAQ — Banco de Identificación de Sistemas
  * @author Atacama Dynamics
- * @version 4.0.0 — Adquisición pura, lazo abierto, binario
+ * @version 4.1.0 — UART Watchdog Fix + Signed RPM
  *
  * Firmware unificado Master/Slave (ROLE_PIN PD7).
  * Cero FSM, cero PID, cero JSON. Solo DAQ + escalones.
@@ -170,8 +170,8 @@ static void encoderUpdate() {
 }
 
 static int16_t encoderGetRPM() {
-    float r = encRPM;
-    return (int16_t)(r < 0 ? -r : r);
+    // FIX: Retornar con signo para ver la inversión de giro en Python
+    return (int16_t)encRPM;
 }
 
 // ============================================================================
@@ -319,7 +319,7 @@ static void escStop() {
 }
 
 // ============================================================================
-// UART — COMUNICACIÓN MASTER ↔ SLAVE
+// UART — COMUNICACIÓN MASTER ↔ SLAVE CON TIMEOUTS
 // ============================================================================
 
 // --- Slave: parseo de comandos entrantes del Master ---
@@ -331,21 +331,41 @@ static uint8_t  uartRxPayloadCmd = 0;
 static uint8_t  uartRxBuf[8];
 static uint8_t  uartRxIdx = 0;
 static uint8_t  uartRxExpected = 0;
+static unsigned long uartRxLastTime = 0; // Timeout Tracker Slave
 
 // --- Master: respuesta de telemetría del Slave ---
 static bool     uartMasterWaitResp = false;
 static uint8_t  uartMasterRespBuf[8];
 static uint8_t  uartMasterRespIdx = 0;
 static uint8_t  uartMasterRespExpected = 0;
+static unsigned long uartMasterRespLastTime = 0; // Timeout Tracker Master
 
 static void uartPoll() {
+    unsigned long now = millis();
+
+    // FIX: Watchdog del Parser Master (Evita quedar bloqueado esperando un byte perdido)
+    if (isMaster && uartMasterWaitResp) {
+        if ((now - uartMasterRespLastTime) > 10) { // 10ms timeout
+            uartMasterWaitResp = false;
+        }
+    }
+
+    // FIX: Watchdog del Parser Slave
+    if (!isMaster && uartRxWaitPayload) {
+        if ((now - uartRxLastTime) > 10) { // 10ms timeout
+            uartRxWaitPayload = false;
+        }
+    }
+
     while (Serial.available()) {
         uint8_t b = Serial.read();
 
         if (isMaster) {
             // Master espera respuesta de telemetría del Slave
             if (uartMasterWaitResp) {
+                uartMasterRespLastTime = now;
                 uartMasterRespBuf[uartMasterRespIdx++] = b;
+                
                 if (uartMasterRespIdx >= uartMasterRespExpected) {
                     uartMasterWaitResp = false;
                     // Parsear: RPM(2 LE) + Hz100(2 LE) + PWM(2 LE) + ESC(2 LE)
@@ -362,10 +382,12 @@ static void uartPoll() {
                 uartMasterWaitResp = true;
                 uartMasterRespIdx = 0;
                 uartMasterRespExpected = 8;
+                uartMasterRespLastTime = now;
             }
         } else {
             // Slave: parsear comandos del Master
             if (uartRxWaitPayload) {
+                uartRxLastTime = now;
                 uartRxBuf[uartRxIdx++] = b;
                 if (uartRxIdx >= uartRxExpected) {
                     uartRxWaitPayload = false;
@@ -381,6 +403,7 @@ static void uartPoll() {
                         uartRxPayloadCmd = b;
                         uartRxIdx = 0;
                         uartRxExpected = 2;
+                        uartRxLastTime = now;
                         break;
                     case UART_CMD_STOP:
                         uartRxCmd = UART_CMD_STOP;
@@ -430,6 +453,8 @@ static void uartSendStop() {
 }
 
 static void uartRequestSlaveTelem() {
+    // Si quedó atascado, resetear antes de solicitar
+    uartMasterWaitResp = false;
     Serial.write(UART_CMD_REQ_TELEM);
 }
 
