@@ -527,21 +527,25 @@ static void spiTransact(TelemetryPacket* pkt) {
 static void processCommand(uint8_t cmd, int16_t val) {
     switch (cmd) {
         case SPI_CMD_DC_BOTH:
+            if (currentMode != MODE_DC) break;  // Cross-lock
             motorSetPWM(val);
-            slaveCmdDC = val;         // Guardar para keepalive
-            uartSendDC(val);          // Reenviar al Slave
+            slaveCmdDC = val;
+            uartSendDC(val);
             break;
 
         case SPI_CMD_AC_MASTER:
+            if (currentMode != MODE_AC) break;  // Cross-lock
             escArmIfNeeded();
             escSetUS((uint16_t)val);
             break;
 
         case SPI_CMD_AC_SLAVE:
+            if (currentMode != MODE_AC) break;  // Cross-lock
             uartSendAC((uint16_t)val);
             break;
 
         case SPI_CMD_AC_BOTH:
+            if (currentMode != MODE_AC) break;  // Cross-lock
             escArmIfNeeded();
             escSetUS((uint16_t)val);
             uartSendAC((uint16_t)val);
@@ -586,10 +590,12 @@ static void slaveProcessCommand() {
 
     switch (uartRxCmd) {
         case UART_CMD_SET_DC:
-            motorSetPWM((int16_t)uartRxVal);
+            if (currentMode == MODE_DC)  // Cross-lock
+                motorSetPWM((int16_t)uartRxVal);
             break;
 
         case UART_CMD_SET_AC:
+            if (currentMode != MODE_AC) break;  // Cross-lock
             if (uartRxVal == 0) {
                 escStop();
             } else {
