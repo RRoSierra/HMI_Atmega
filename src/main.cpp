@@ -53,13 +53,13 @@
 #define SPI_CS_PIN      10   // PB2 — CS del ESP32
 
 // Intervalo de envío de telemetría (Master)
-#define TELEM_INTERVAL_MS  10  // 100 Hz al ESP32
+#define TELEM_INTERVAL_MS  5  // 100 Hz al ESP32
 
 // Intervalo de request de telemetría al Slave
-#define SLAVE_REQ_MS    10     // 100 Hz
+#define SLAVE_REQ_MS    2     // 100 Hz
 
 // Keepalive: re-envío periódico de actuación al Slave
-#define SLAVE_KEEPALIVE_MS 30  // 20 Hz
+#define SLAVE_KEEPALIVE_MS 2  // 20 Hz
 
 // ESC
 #define ESC_NEUTRAL     1500
@@ -534,18 +534,20 @@ static void processCommand(uint8_t cmd, int16_t val) {
             break;
 
         case SPI_CMD_AC_MASTER:
-            if (currentMode != MODE_AC) break;  // Cross-lock
+            if (currentMode != MODE_AC) break;  // Cross-lock modo
             escArmIfNeeded();
             escSetUS((uint16_t)val);
+            uartSendAC(0);              // Cross-lock: apagar Slave
             break;
 
         case SPI_CMD_AC_SLAVE:
-            if (currentMode != MODE_AC) break;  // Cross-lock
+            if (currentMode != MODE_AC) break;  // Cross-lock modo
+            escStop();                  // Cross-lock: apagar Master
             uartSendAC((uint16_t)val);
             break;
 
         case SPI_CMD_AC_BOTH:
-            if (currentMode != MODE_AC) break;  // Cross-lock
+            if (currentMode != MODE_AC) break;  // Cross-lock modo
             escArmIfNeeded();
             escSetUS((uint16_t)val);
             uartSendAC((uint16_t)val);
@@ -681,9 +683,11 @@ void loop() {
         }
 
         // 3b. Keepalive: re-enviar actuación DC al Slave
-        if ((now - lastKeepalive) >= SLAVE_KEEPALIVE_MS) {
+        if(currentMode == MODE_DC){
+          if ((now - lastKeepalive) >= SLAVE_KEEPALIVE_MS) {
             lastKeepalive = now;
             uartSendDC(slaveCmdDC);
+          }
         }
 
         // 4. Enviar TelemetryPacket al ESP32
