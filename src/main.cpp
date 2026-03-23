@@ -80,9 +80,10 @@
 // PROTOCOLO UART: MASTER ↔ SLAVE (datos crudos)
 // ============================================================================
 // Los comandos se envían como un valor de 2 bytes (big‑endian) con significado:
-#define UART_REQ_TELEM       0xFFFF   // Solicitud de telemetría
-#define UART_MODE_DC_VAL     0x8A00   // Cambio a modo DC
-#define UART_MODE_AC_VAL     0x8B00   // Cambio a modo AC
+// IMPORTANTE: cast a int16_t para que la comparación con val (int16_t) funcione
+#define UART_REQ_TELEM       ((int16_t)0xFFFF)   // -1: Solicitud de telemetría
+#define UART_MODE_DC_VAL     ((int16_t)0x8A00)   // -30208: Cambio a modo DC
+#define UART_MODE_AC_VAL     ((int16_t)0x8B00)   // -29952: Cambio a modo AC
 
 // El Slave responde a UART_REQ_TELEM con 8 bytes en little‑endian:
 // [ RPM_L, RPM_H, Hz_L, Hz_H, PWM_L, PWM_H, ESC_L, ESC_H ]
@@ -385,8 +386,8 @@ static void masterRequestTelem() {
     Serial.write(0xFF);
     Serial.write(0xFF);
 
-    // Leer respuesta de 8 bytes con timeout de 5 ms
-    Serial.setTimeout(5);
+    // Leer respuesta de 8 bytes con timeout de 2 ms
+    Serial.setTimeout(2);
     uint8_t buf[8];
     if (Serial.readBytes(buf, 8) == 8) {
         slaveRPM   = (int16_t)((uint16_t)buf[0] | ((uint16_t)buf[1] << 8));
