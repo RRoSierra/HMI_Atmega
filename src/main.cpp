@@ -126,6 +126,10 @@ static uint16_t slaveESC      = ESC_NEUTRAL;
 // --- Keepalive: último valor comandado al Slave ---
 static int16_t  slaveCmdDC    = 0;
 
+// --- Filtro de reenvío: evitar saturar al Slave ---
+static int16_t  lastSentDcToSlave = -999;
+static uint16_t lastSentAcToSlave = 0;
+
 // --- Objetos ---
 static Servo esc;
 static AS5600 as5600(&Wire);
@@ -277,6 +281,9 @@ static void motorInit() {
  * Positivo = "derecha" para Master, invertido para Slave.
  */
 static void motorSetPWM(int16_t pwm) {
+    // Clamping de seguridad: evitar overflow de 8 bits
+    if (pwm > 255) pwm = 255;
+    if (pwm < -255) pwm = -255;
     appliedPWM = pwm;
     if (pwm == 0) {
         // Coast (rueda libre)
@@ -366,9 +373,9 @@ static void uartPoll() {
         }
     }
 
-    // FIX: Watchdog del Parser Slave
+    // FIX: Watchdog del Parser Slave (5ms timeout más agresivo)
     if (!isMaster && uartRxWaitPayload) {
-        if ((now - uartRxLastTime) > 10) { // 10ms timeout
+        if ((now - uartRxLastTime) > 5) { // 5ms timeout
             uartRxWaitPayload = false;
         }
     }
@@ -530,7 +537,10 @@ static void processCommand(uint8_t cmd, int16_t val) {
             if (currentMode != MODE_DC) break;  // Cross-lock
             motorSetPWM(val);
             slaveCmdDC = val;
-            uartSendDC(val);
+            if (val != lastSentDcToSlave) {
+                uartSendDC(val);
+                lastSentDcToSlave = val;
+            }
             break;
 
         case SPI_CMD_AC_MASTER:
@@ -550,13 +560,18 @@ static void processCommand(uint8_t cmd, int16_t val) {
             if (currentMode != MODE_AC) break;  // Cross-lock modo
             escArmIfNeeded();
             escSetUS((uint16_t)val);
-            uartSendAC((uint16_t)val);
+            if ((uint16_t)val != lastSentAcToSlave) {
+                uartSendAC((uint16_t)val);
+                lastSentAcToSlave = (uint16_t)val;
+            }
             break;
 
         case SPI_CMD_STOP_ALL:
             motorSetPWM(0);
             escStop();
             slaveCmdDC = 0;           // Limpiar keepalive
+            lastSentDcToSlave = -999; // Reset filtro
+            lastSentAcToSlave = 0;
             uartSendStop();
             break;
 
@@ -564,6 +579,8 @@ static void processCommand(uint8_t cmd, int16_t val) {
             motorSetPWM(0);
             escStop();
             slaveCmdDC = 0;
+            lastSentDcToSlave = -999;
+            lastSentAcToSlave = 0;
             currentMode = MODE_DC;
             uartSendStop();
             uartSendMode(MODE_DC);
@@ -573,6 +590,8 @@ static void processCommand(uint8_t cmd, int16_t val) {
             motorSetPWM(0);
             escStop();
             slaveCmdDC = 0;
+            lastSentDcToSlave = -999;
+            lastSentAcToSlave = 0;
             currentMode = MODE_AC;
             uartSendStop();
             uartSendMode(MODE_AC);
