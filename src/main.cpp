@@ -15,7 +15,7 @@
  *   RX: 3 bytes [CMD, VAL_H, VAL_L] del HMI
  *
  * Protocolo UART (Master ↔ Slave, 115200, full-duplex):
- *   Master→Slave: 3 bytes [CMD, HI, LO]   (comandos)
+ *   Master→Slave: 5 bytes [SYNC, CMD, HI, LO, XOR]  (frame con sync+checksum, estilo WTC)
  *   Slave→Master: 10 bytes [HDR, data×8, XOR]  (telemetría push cada 10ms)
  *
  * Coordinación inversa: Master y Slave están enfrentados (180°).
@@ -74,7 +74,8 @@
 // § 4. PROTOCOLO UART — MASTER ↔ SLAVE
 // ═══════════════════════════════════════════════════════════════════════
 
-// Master → Slave: 3 bytes [CMD, HI, LO]
+// Master → Slave: 5 bytes [SYNC, CMD, HI, LO, XOR]  (como WTC, con sync+checksum)
+#define USYNC         0x55   // Byte de sincronización (cabecera de frame)
 #define UCMD_DC       0xA1   // Set DC PWM (int16_t)
 #define UCMD_AC       0xA2   // Set ESC µs (uint16_t)
 #define UCMD_STOP     0xA3   // Stop all
@@ -301,14 +302,18 @@ static void escStop() {
 // § 11. UART — COMUNICACIÓN MASTER ↔ SLAVE
 // ═══════════════════════════════════════════════════════════════════════
 
-// --- Master: enviar comando de 3 bytes al Slave ---
+// --- Master: enviar comando de 5 bytes al Slave [SYNC, CMD, HI, LO, XOR] ---
 static void uartSendCmd(uint8_t cmd, int16_t val) {
-    uint8_t buf[3] = {
+    uint8_t hi = (uint8_t)((val >> 8) & 0xFF);
+    uint8_t lo = (uint8_t)(val & 0xFF);
+    uint8_t buf[5] = {
+        USYNC,
         cmd,
-        (uint8_t)((val >> 8) & 0xFF),
-        (uint8_t)(val & 0xFF)
+        hi,
+        lo,
+        (uint8_t)(USYNC ^ cmd ^ hi ^ lo)
     };
-    Serial.write(buf, 3);
+    Serial.write(buf, 5);
 }
 
 // --- Master: parser no-bloqueante de telemetría del Slave (10 bytes) ---
@@ -342,28 +347,43 @@ static void masterParseUART() {
     }
 }
 
-// --- Slave: parser no-bloqueante de comandos (3 bytes) ---
-static uint8_t sRxBuf[2];
-static uint8_t sRxIdx = 0;
-static uint8_t sRxCmd = 0;
-static bool    sRxActive = false;
+// --- Slave: parser no-bloqueante de comandos con frame [SYNC, CMD, HI, LO, XOR] ---
+// Máquina de estados con re-sincronización automática (estilo WTC commUpdate)
+enum SRxState : uint8_t { SRX_SYNC, SRX_CMD, SRX_HI, SRX_LO, SRX_XOR };
+static SRxState sRxState = SRX_SYNC;
+static uint8_t  sRxCmd   = 0;
+static uint8_t  sRxHi    = 0;
+static uint8_t  sRxLo    = 0;
 
 static void slaveParseUART() {
     while (Serial.available()) {
         uint8_t b = Serial.read();
-        if (!sRxActive) {
-            // Bytes de comando: 0xA1..0xA5
-            if (b >= UCMD_DC && b <= UCMD_MODE_AC) {
-                sRxCmd = b;
-                sRxActive = true;
-                sRxIdx = 0;
-            }
-        } else {
-            sRxBuf[sRxIdx++] = b;
-            if (sRxIdx == 2) {
-                sRxActive = false;
-                int16_t val = (int16_t)(((uint16_t)sRxBuf[0] << 8) | sRxBuf[1]);
-
+        switch (sRxState) {
+            case SRX_SYNC:
+                if (b == USYNC) sRxState = SRX_CMD;
+                break;
+            case SRX_CMD:
+                if (b >= UCMD_DC && b <= UCMD_MODE_AC) {
+                    sRxCmd = b;
+                    sRxState = SRX_HI;
+                } else {
+                    sRxState = SRX_SYNC;  // byte inválido → resync
+                }
+                break;
+            case SRX_HI:
+                sRxHi = b;
+                sRxState = SRX_LO;
+                break;
+            case SRX_LO:
+                sRxLo = b;
+                sRxState = SRX_XOR;
+                break;
+            case SRX_XOR: {
+                sRxState = SRX_SYNC;  // siempre volver a esperar sync
+                // Validar checksum
+                if (b != (uint8_t)(USYNC ^ sRxCmd ^ sRxHi ^ sRxLo)) break;
+                // Frame válido → ejecutar
+                int16_t val = (int16_t)(((uint16_t)sRxHi << 8) | sRxLo);
                 switch (sRxCmd) {
                     case UCMD_DC:
                         if (mode == DC) motorSet(val);
@@ -389,6 +409,7 @@ static void slaveParseUART() {
                         mode = AC;
                         break;
                 }
+                break;
             }
         }
     }
