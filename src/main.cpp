@@ -1,20 +1,25 @@
 /**
  * @file main.cpp
- * @brief ATmega328P DAQ — Banco de Identificación de Sistemas
+ * @brief ATmega328P V2 — "Marioneta" DAQ para Identificación de Sistemas
  * @author Atacama Dynamics
- * @version 5.2.0 — UART simplificado (datos crudos, sin máquinas de estado)
+ * @version 2.0.0
  *
- * Firmware unificado Master/Slave (ROLE_PIN PD7).
- * Cero FSM, cero PID, cero JSON. Solo DAQ + escalones.
+ * Firmware minimalista unificado Master/Slave (ROLE_PIN PD7).
+ * Objetivo: recibir actuación del HMI y reportar medición a máxima frecuencia.
  *
- * Master: SPI Master → ESP32, UART → Slave
- * Slave:  UART → Master
+ * Arquitectura:
+ *   PC (HMI.py) ↔ USB 460800 ↔ ESP32 (bypass SPI) ↔ ATmega Master ↔ ATmega Slave (UART 115200)
  *
- * TelemetryPacket 22 bytes (Master → ESP32 → PC)
+ * Protocolo SPI (Master ↔ ESP32):
+ *   TX: TelemetryPacket 22 bytes cada 5ms (200 Hz)
+ *   RX: 3 bytes [CMD, VAL_H, VAL_L] del HMI
  *
- * Comunicación UART entre Master y Slave:
- *   - Master envía valores de 2 bytes en big‑endian (uint16_t o int16_t).
- *   - Slave responde a solicitud de telemetría con 8 bytes en little‑endian.
+ * Protocolo UART (Master ↔ Slave, 115200, full-duplex):
+ *   Master→Slave: 3 bytes [CMD, HI, LO]   (comandos)
+ *   Slave→Master: 10 bytes [HDR, data×8, XOR]  (telemetría push cada 10ms)
+ *
+ * Coordinación inversa: Master y Slave están enfrentados (180°).
+ * Para moverse en la misma dirección global, Slave invierte su motor DC.
  */
 
 #include <Arduino.h>
@@ -23,247 +28,218 @@
 #include <Wire.h>
 #include <AS5600.h>
 
-// ============================================================================
-// CONFIGURACIÓN DE HARDWARE
-// ============================================================================
+// ═══════════════════════════════════════════════════════════════════════
+// § 1. HARDWARE
+// ═══════════════════════════════════════════════════════════════════════
 
-#define ROLE_PIN        7    // PD7: HIGH=Master, LOW=Slave
+#define ROLE_PIN     7     // PD7: HIGH = Master, LOW = Slave
+#define EN_PIN       5     // PD5 — PWM enable (L298N)
+#define IN1_PIN      A3    // PC3 — dirección A
+#define IN2_PIN      A2    // PC2 — dirección B
+#define ESC_PIN      4     // PD4 — señal PWM al ESC
+#define ENCODER_A    2     // PD2 (INT0)
+#define ENCODER_B    3     // PD3 (INT1)
+#define SPI_CS_PIN   10    // PB2 — CS del ESP32
 
-// Motor DC (L298N)
-#define EN_PIN          5    // PD5 — PWM enable
-#define IN1_PIN         A3   // PC3 — dirección A
-#define IN2_PIN         A2   // PC2 — dirección B
+// ═══════════════════════════════════════════════════════════════════════
+// § 2. CONSTANTES DE TIMING
+// ═══════════════════════════════════════════════════════════════════════
 
-// Motor Brushless (ESC)
-#define ESC_PIN         4    // PD4 — señal PWM al ESC
+#define ENC_CALC_MS      2     // 500 Hz cálculo RPM
+#define BLDC_POLL_MS     2     // 500 Hz lectura I2C AS5600
+#define BLDC_CALC_MS     100   // 10 Hz cálculo Hz
+#define BLDC_EMA_ALPHA   0.3f
+#define BLDC_OUTLIER     512   // delta > esto = descartado
+#define TELEM_SPI_MS     5     // 200 Hz telemetría al ESP32
+#define SLAVE_PUSH_MS    10    // 100 Hz telemetría Slave→Master
+#define ESC_NEUTRAL      1500
 
-// Encoder de efecto Hall (motor DC)
-#define ENCODER_PIN_A   2    // PD2 (INT0)
-#define ENCODER_PIN_B   3    // PD3 (INT1)
-#define MOTOR_GEAR_RATIO  370
-#define MOTOR_ENCODER_PPR 11
-#define ENCODER_PPR_WHEEL ((long)MOTOR_ENCODER_PPR * (long)MOTOR_GEAR_RATIO)
-#define ENCODER_UPDATE_MS_NORMAL 10  // 100 Hz (modo compartido)
-#define ENCODER_UPDATE_MS_FAST   2   // 500 Hz (modo DC exclusivo)
+// Encoder
+#define ENC_PPR  ((long)11 * 370)  // 4070 pulsos/revolución
 
-// AS5600 (BLDC)
-#define BLDC_POLL_MS    2      // 500 Hz I2C polling
-#define BLDC_CALC_MS    100    // 10 Hz cálculo Hz
-#define BLDC_EMA_ALPHA  0.3f
-#define BLDC_OUTLIER    512    // delta raw > esto = outlier
+// ═══════════════════════════════════════════════════════════════════════
+// § 3. PROTOCOLO SPI — COMANDOS HMI → ESP32 → ATmega (3 bytes)
+// ═══════════════════════════════════════════════════════════════════════
 
-// SPI al ESP32 (Master solamente)
-#define SPI_CS_PIN      10   // PB2 — CS del ESP32
+#define CMD_NONE       0x00
+#define CMD_DC_BOTH    0x74
+#define CMD_AC_MASTER  0x72
+#define CMD_AC_SLAVE   0x73
+#define CMD_AC_BOTH    0x75
+#define CMD_STOP       0x76
+#define CMD_MODE_DC    0x77
+#define CMD_MODE_AC    0x78
 
-// Intervalo de envío de telemetría (Master)
-#define TELEM_INTERVAL_MS  5  // 200 Hz al ESP32
+// ═══════════════════════════════════════════════════════════════════════
+// § 4. PROTOCOLO UART — MASTER ↔ SLAVE
+// ═══════════════════════════════════════════════════════════════════════
 
-// Intervalo de solicitud de telemetría del Slave (Master)
-#define SLAVE_TELEM_PUSH_MS  10  // 100 Hz request
+// Master → Slave: 3 bytes [CMD, HI, LO]
+#define UCMD_DC       0xA1   // Set DC PWM (int16_t)
+#define UCMD_AC       0xA2   // Set ESC µs (uint16_t)
+#define UCMD_STOP     0xA3   // Stop all
+#define UCMD_MODE_DC  0xA4   // Cambiar a modo DC
+#define UCMD_MODE_AC  0xA5   // Cambiar a modo AC
 
-// ESC
-#define ESC_NEUTRAL     1500
+// Slave → Master: 10 bytes [HDR, RPM_L, RPM_H, Hz_L, Hz_H, PWM_L, PWM_H, ESC_L, ESC_H, XOR]
+#define UTELEM_HDR    0xBB
 
-// ============================================================================
-// PROTOCOLO SPI: COMANDOS QUE VIENEN DEL ESP32 (3 bytes)
-// ============================================================================
-#define SPI_CMD_NONE        0x00
-#define SPI_CMD_DC_BOTH     0x74
-#define SPI_CMD_AC_MASTER   0x72
-#define SPI_CMD_AC_SLAVE    0x73
-#define SPI_CMD_AC_BOTH     0x75
-#define SPI_CMD_STOP_ALL    0x76
-#define SPI_CMD_MODE_DC     0x77
-#define SPI_CMD_MODE_AC     0x78
+// ═══════════════════════════════════════════════════════════════════════
+// § 5. PAQUETE DE TELEMETRÍA — 22 bytes via SPI al ESP32
+// ═══════════════════════════════════════════════════════════════════════
 
-// ============================================================================
-// PROTOCOLO UART: MASTER ↔ SLAVE (datos crudos)
-// ============================================================================
-// Los comandos se envían como un valor de 2 bytes (big‑endian) con significado:
-// IMPORTANTE: cast a int16_t para que la comparación con val (int16_t) funcione
-#define UART_REQ_TELEM       ((int16_t)0xFFFF)   // -1: Solicitud de telemetría
-#define UART_MODE_DC_VAL     ((int16_t)0x8A00)   // -30208: Cambio a modo DC
-#define UART_MODE_AC_VAL     ((int16_t)0x8B00)   // -29952: Cambio a modo AC
-
-// El Slave responde a UART_REQ_TELEM con 8 bytes en little‑endian:
-// [ RPM_L, RPM_H, Hz_L, Hz_H, PWM_L, PWM_H, ESC_L, ESC_H ]
-
-// ============================================================================
-// PAQUETE DE TELEMETRÍA (22 bytes, enviado por SPI al ESP32)
-// ============================================================================
 struct __attribute__((packed)) TelemetryPacket {
-    uint8_t  startByte;     // 0xAA
-    uint32_t timestamp_ms;  // millis()
-    int16_t  mPWM_applied;  // PWM Master DC (-255..255)
-    int16_t  sPWM_applied;  // PWM Slave DC (-255..255)
-    uint16_t mESC_applied;  // Master ESC µs (1000-2000)
-    uint16_t sESC_applied;  // Slave ESC µs (1000-2000)
-    int16_t  mRPM;          // Master encoder RPM
-    int16_t  sRPM;          // Slave encoder RPM
-    uint16_t mHz;           // Master Hz * 100
-    uint16_t sHz;           // Slave Hz * 100
-    uint8_t  checksum;      // XOR bytes[0..20]
+    uint8_t  start;    // 0xAA
+    uint32_t ts_ms;    // millis()
+    int16_t  mPWM;     // Master DC PWM aplicado (-255..255)
+    int16_t  sPWM;     // Slave DC PWM aplicado
+    uint16_t mESC;     // Master ESC µs (1000..2000)
+    uint16_t sESC;     // Slave ESC µs
+    int16_t  mRPM;     // Master encoder RPM
+    int16_t  sRPM;     // Slave encoder RPM
+    uint16_t mHz;      // Master Hz × 100
+    uint16_t sHz;      // Slave Hz × 100
+    uint8_t  xor_chk;  // XOR bytes[0..20]
 };
 
-// ============================================================================
-// VARIABLES GLOBALES
-// ============================================================================
-static bool isMaster = false;
+// ═══════════════════════════════════════════════════════════════════════
+// § 6. VARIABLES GLOBALES
+// ═══════════════════════════════════════════════════════════════════════
 
-// --- Modo de prueba ---
-enum TestMode { MODE_DC, MODE_AC };
-static TestMode currentMode = MODE_DC;
+static bool isMaster;
 
-// --- Estado de actuación local ---
-static int16_t  appliedPWM = 0;      // PWM aplicado al DC local
-static uint16_t appliedESC = ESC_NEUTRAL; // µs aplicado al ESC local
+enum Mode { DC, AC };
+static Mode mode = DC;
 
-// --- Telemetría del Slave (vista desde el Master) ---
-static int16_t  slaveRPM      = 0;
-static uint16_t slaveHz100    = 0;
-static int16_t  slavePWM      = 0;
-static uint16_t slaveESC      = ESC_NEUTRAL;
+// Actuación local
+static int16_t  localPWM = 0;
+static uint16_t localESC = ESC_NEUTRAL;
 
-// --- Filtro de reenvío: evitar saturar al Slave ---
-static int16_t  lastSentDcToSlave = -999;
-static uint16_t lastSentAcToSlave = 0;
+// Telemetría del Slave (vista desde Master)
+static int16_t  slvRPM = 0;
+static uint16_t slvHz  = 0;
+static int16_t  slvPWM = 0;
+static uint16_t slvESC = ESC_NEUTRAL;
 
-// --- Objetos ---
+// Filtro de reenvío (evita saturar UART al Slave)
+static int16_t  lastFwdDC = -999;
+static uint16_t lastFwdAC = 0;
+
+// Objetos
 static Servo esc;
-static AS5600 as5600(&Wire);
-
-// --- ESC ---
+static AS5600 as5600Sensor(&Wire);
 static bool escArmed = false;
 
-// ============================================================================
-// ENCODER — ISR + cálculo RPM
-// ============================================================================
-static volatile long encPulses = 0;
-static long  encLastPulses = 0;
-static unsigned long encLastTime = 0;
-static float encRPM = 0.0f;
+// ═══════════════════════════════════════════════════════════════════════
+// § 7. ENCODER — ISR + cálculo RPM (500 Hz)
+// ═══════════════════════════════════════════════════════════════════════
 
-static void encoderISR_A() {
-    if (digitalRead(ENCODER_PIN_A) == digitalRead(ENCODER_PIN_B))
-        encPulses++;
-    else
-        encPulses--;
+static volatile long encCount = 0;
+static long          encPrev  = 0;
+static unsigned long encT     = 0;
+static float         encRPM   = 0.0f;
+
+static void isrA() {
+    encCount += (digitalRead(ENCODER_A) == digitalRead(ENCODER_B)) ? 1 : -1;
 }
-
-static void encoderISR_B() {
-    if (digitalRead(ENCODER_PIN_A) != digitalRead(ENCODER_PIN_B))
-        encPulses++;
-    else
-        encPulses--;
+static void isrB() {
+    encCount += (digitalRead(ENCODER_A) != digitalRead(ENCODER_B)) ? 1 : -1;
 }
 
 static void encoderInit() {
-    pinMode(ENCODER_PIN_A, INPUT_PULLUP);
-    pinMode(ENCODER_PIN_B, INPUT_PULLUP);
-    encPulses = 0;
-    encLastPulses = 0;
-    encLastTime = millis();
-    encRPM = 0.0f;
-    attachInterrupt(digitalPinToInterrupt(ENCODER_PIN_A), encoderISR_A, CHANGE);
-    attachInterrupt(digitalPinToInterrupt(ENCODER_PIN_B), encoderISR_B, CHANGE);
+    pinMode(ENCODER_A, INPUT_PULLUP);
+    pinMode(ENCODER_B, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(ENCODER_A), isrA, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENCODER_B), isrB, CHANGE);
+    encT = millis();
 }
 
 static void encoderUpdate() {
     unsigned long now = millis();
-    uint8_t interval = (currentMode == MODE_DC) ? ENCODER_UPDATE_MS_FAST : ENCODER_UPDATE_MS_NORMAL;
-    if ((now - encLastTime) < interval) return;
+    if (now - encT < ENC_CALC_MS) return;
 
     noInterrupts();
-    long cur = encPulses;
+    long c = encCount;
     interrupts();
 
-    long delta = cur - encLastPulses;
-    unsigned long dt = now - encLastTime;
-    encLastPulses = cur;
-    encLastTime = now;
+    long delta = c - encPrev;
+    unsigned long dt = now - encT;
+    encPrev = c;
+    encT = now;
 
-    if (dt > 0 && ENCODER_PPR_WHEEL > 0) {
-        encRPM = ((float)delta / (float)ENCODER_PPR_WHEEL) * (60000.0f / (float)dt);
+    if (dt > 0) {
+        encRPM = ((float)delta / (float)ENC_PPR) * (60000.0f / (float)dt);
     }
 }
 
-static int16_t encoderGetRPM() {
-    return (int16_t)encRPM;
-}
+static int16_t getRPM() { return (int16_t)encRPM; }
 
-// ============================================================================
-// AS5600 — BLDC Hz
-// ============================================================================
-static bool     as5600Connected = false;
-static uint16_t as5600LastRaw   = 0;
-static int32_t  as5600AccDelta  = 0;
-static float    as5600Filtered  = 0.0f;
-static bool     as5600First     = true;
-static unsigned long as5600PollT = 0;
-static unsigned long as5600CalcT = 0;
+// ═══════════════════════════════════════════════════════════════════════
+// § 8. AS5600 — BLDC Hz (500 Hz poll, 10 Hz cálculo)
+// ═══════════════════════════════════════════════════════════════════════
+
+static bool     a5ok    = false;
+static uint16_t a5last  = 0;
+static int32_t  a5acc   = 0;
+static float    a5hz    = 0.0f;
+static bool     a5first = true;
+static unsigned long a5pollT = 0;
+static unsigned long a5calcT = 0;
 
 static void bldcInit() {
     Wire.begin();
     Wire.setClock(400000UL);
-    as5600.begin();
-    as5600Connected = as5600.isConnected();
-    if (as5600Connected) {
-        as5600.setZPosition(0);
-        as5600.setMPosition(0);
-        as5600.setMaxAngle(0);
-        as5600LastRaw = as5600.rawAngle();
+    as5600Sensor.begin();
+    a5ok = as5600Sensor.isConnected();
+    if (a5ok) {
+        as5600Sensor.setZPosition(0);
+        as5600Sensor.setMPosition(0);
+        as5600Sensor.setMaxAngle(0);
+        a5last = as5600Sensor.rawAngle();
     }
-    as5600AccDelta = 0;
-    as5600Filtered = 0.0f;
-    as5600First = true;
-    as5600PollT = millis();
-    as5600CalcT = millis();
+    a5pollT = a5calcT = millis();
 }
 
 static void bldcUpdate() {
+    if (!a5ok) return;
     unsigned long now = millis();
 
-    if (!as5600Connected) return;
-
-    // Polling
-    if ((now - as5600PollT) >= BLDC_POLL_MS) {
-        as5600PollT = now;
-        uint16_t raw = as5600.rawAngle();
-        if (!as5600First) {
-            int16_t delta = (int16_t)raw - (int16_t)as5600LastRaw;
-            if (delta > 2048)  delta -= 4096;
-            if (delta < -2048) delta += 4096;
-            if (delta > -BLDC_OUTLIER && delta < BLDC_OUTLIER) {
-                as5600AccDelta += delta;
+    // Poll ángulo crudo
+    if (now - a5pollT >= BLDC_POLL_MS) {
+        a5pollT = now;
+        uint16_t raw = as5600Sensor.rawAngle();
+        if (!a5first) {
+            int16_t d = (int16_t)raw - (int16_t)a5last;
+            if (d >  2048) d -= 4096;
+            if (d < -2048) d += 4096;
+            if (d > -BLDC_OUTLIER && d < BLDC_OUTLIER) {
+                a5acc += d;
             }
         } else {
-            as5600First = false;
+            a5first = false;
         }
-        as5600LastRaw = raw;
+        a5last = raw;
     }
 
-    // Cálculo Hz
-    if ((now - as5600CalcT) >= BLDC_CALC_MS) {
-        unsigned long elapsed = now - as5600CalcT;
-        as5600CalcT = now;
-        if (elapsed > 0) {
-            float rev = (float)as5600AccDelta / 4096.0f;
-            float sec = (float)elapsed / 1000.0f;
-            float hz  = rev / sec;
+    // Calcular Hz
+    if (now - a5calcT >= BLDC_CALC_MS) {
+        unsigned long dt = now - a5calcT;
+        a5calcT = now;
+        if (dt > 0) {
+            float hz = (float)a5acc / 4096.0f / ((float)dt / 1000.0f);
             if (hz < 0.0f) hz = -hz;
-            as5600Filtered = BLDC_EMA_ALPHA * hz + (1.0f - BLDC_EMA_ALPHA) * as5600Filtered;
+            a5hz = BLDC_EMA_ALPHA * hz + (1.0f - BLDC_EMA_ALPHA) * a5hz;
         }
-        as5600AccDelta = 0;
+        a5acc = 0;
     }
 }
 
-static uint16_t bldcGetHz100() {
-    return (uint16_t)(as5600Filtered * 100.0f);
-}
+static uint16_t getHz100() { return (uint16_t)(a5hz * 100.0f); }
 
-// ============================================================================
-// MOTOR DC — L298N
-// ============================================================================
+// ═══════════════════════════════════════════════════════════════════════
+// § 9. MOTOR DC — L298N (coordinación inversa Master/Slave)
+// ═══════════════════════════════════════════════════════════════════════
+
 static void motorInit() {
     pinMode(EN_PIN, OUTPUT);
     pinMode(IN1_PIN, OUTPUT);
@@ -273,11 +249,11 @@ static void motorInit() {
     digitalWrite(IN2_PIN, LOW);
 }
 
-static void motorSetPWM(int16_t pwm) {
-    // Clamping de seguridad
-    if (pwm > 255) pwm = 255;
+static void motorSet(int16_t pwm) {
+    if (pwm >  255) pwm =  255;
     if (pwm < -255) pwm = -255;
-    appliedPWM = pwm;
+    localPWM = pwm;
+
     if (pwm == 0) {
         analogWrite(EN_PIN, 0);
         digitalWrite(IN1_PIN, LOW);
@@ -285,29 +261,21 @@ static void motorSetPWM(int16_t pwm) {
         return;
     }
 
-    bool forward;
-    if (isMaster) {
-        forward = (pwm > 0);
-    } else {
-        forward = (pwm < 0);  // Slave enfrentado
-    }
+    // Master: forward = pwm > 0
+    // Slave:  forward = pwm < 0  (enfrentados = dirección invertida)
+    bool fwd = isMaster ? (pwm > 0) : (pwm < 0);
+    uint8_t spd = (uint8_t)(pwm < 0 ? -pwm : pwm);
 
-    uint8_t speed = (uint8_t)(pwm < 0 ? -pwm : pwm);
-
-    if (forward) {
-        digitalWrite(IN1_PIN, LOW);
-        digitalWrite(IN2_PIN, HIGH);
-    } else {
-        digitalWrite(IN1_PIN, HIGH);
-        digitalWrite(IN2_PIN, LOW);
-    }
-    analogWrite(EN_PIN, speed);
+    digitalWrite(IN1_PIN, fwd ? LOW  : HIGH);
+    digitalWrite(IN2_PIN, fwd ? HIGH : LOW);
+    analogWrite(EN_PIN, spd);
 }
 
-// ============================================================================
-// ESC — Motor Brushless
-// ============================================================================
-static void escArmIfNeeded() {
+// ═══════════════════════════════════════════════════════════════════════
+// § 10. ESC — Motor Brushless
+// ═══════════════════════════════════════════════════════════════════════
+
+static void escArm() {
     if (escArmed) return;
     esc.attach(ESC_PIN);
     esc.writeMicroseconds(1000);
@@ -317,90 +285,145 @@ static void escArmIfNeeded() {
     escArmed = true;
 }
 
-static void escSetUS(uint16_t us) {
+static void escSet(uint16_t us) {
     if (us < 1000) us = 1000;
     if (us > 2000) us = 2000;
-    appliedESC = us;
-    if (!escArmed) return;
-    esc.writeMicroseconds(us);
+    localESC = us;
+    if (escArmed) esc.writeMicroseconds(us);
 }
 
 static void escStop() {
-    appliedESC = ESC_NEUTRAL;
-    if (escArmed) {
-        esc.writeMicroseconds(ESC_NEUTRAL);
-    }
+    localESC = ESC_NEUTRAL;
+    if (escArmed) esc.writeMicroseconds(ESC_NEUTRAL);
 }
 
-// ============================================================================
-// UART — COMUNICACIÓN SIMPLIFICADA (datos crudos)
-// ============================================================================
-// Master: envía valores de 2 bytes, solicita telemetría periódicamente.
-// Slave:  recibe valores y actúa, responde a solicitud con 8 bytes.
+// ═══════════════════════════════════════════════════════════════════════
+// § 11. UART — COMUNICACIÓN MASTER ↔ SLAVE
+// ═══════════════════════════════════════════════════════════════════════
 
-static void uartSendVal(int16_t val) {
-    Serial.write((uint8_t)((val >> 8) & 0xFF));
-    Serial.write((uint8_t)(val & 0xFF));
+// --- Master: enviar comando de 3 bytes al Slave ---
+static void uartSendCmd(uint8_t cmd, int16_t val) {
+    uint8_t buf[3] = {
+        cmd,
+        (uint8_t)((val >> 8) & 0xFF),
+        (uint8_t)(val & 0xFF)
+    };
+    Serial.write(buf, 3);
 }
 
-static void uartProcess() {
-    // Slave: leer comandos (siempre que haya al menos 2 bytes)
-    if (Serial.available() >= 2) {
-        uint8_t hi = Serial.read();
-        uint8_t lo = Serial.read();
-        int16_t val = ((uint16_t) hi << 8) | lo;
+// --- Master: parser no-bloqueante de telemetría del Slave (10 bytes) ---
+static uint8_t mRxBuf[9];   // 8 datos + 1 XOR
+static uint8_t mRxIdx = 0;
+static bool    mRxActive = false;
 
-        // Detección de comandos especiales
-        if (val == 0) {
-            motorSetPWM(0);
-            escStop();
-        } else if (val == UART_MODE_DC_VAL) {
-            motorSetPWM(0);
-            escStop();
-            currentMode = MODE_DC;
-        } else if (val == UART_MODE_AC_VAL) {
-            motorSetPWM(0);
-            escStop();
-            currentMode = MODE_AC;
-        } else if (val == UART_REQ_TELEM) {
-            // Responder con telemetría (8 bytes little‑endian)
-            int16_t  rpm   = encoderGetRPM();
-            uint16_t hz100 = bldcGetHz100();
-            int16_t  pwm   = appliedPWM;
-            uint16_t esc   = appliedESC;
-            Serial.write((uint8_t*)&rpm,   2);
-            Serial.write((uint8_t*)&hz100, 2);
-            Serial.write((uint8_t*)&pwm,   2);
-            Serial.write((uint8_t*)&esc,   2);
-        } else if (currentMode == MODE_DC && val >= -255 && val <= 255) {
-            motorSetPWM(val);
-        } else if (currentMode == MODE_AC && val >= 1000 && val <= 2000) {
-            escArmIfNeeded();
-            escSetUS((uint16_t)val);
+static void masterParseUART() {
+    while (Serial.available()) {
+        uint8_t b = Serial.read();
+        if (!mRxActive) {
+            if (b == UTELEM_HDR) {
+                mRxActive = true;
+                mRxIdx = 0;
+            }
+        } else {
+            mRxBuf[mRxIdx++] = b;
+            if (mRxIdx == 9) {
+                mRxActive = false;
+                // Verificar XOR
+                uint8_t x = 0;
+                for (uint8_t i = 0; i < 8; i++) x ^= mRxBuf[i];
+                if (x == mRxBuf[8]) {
+                    slvRPM = (int16_t)((uint16_t)mRxBuf[0] | ((uint16_t)mRxBuf[1] << 8));
+                    slvHz  = (uint16_t)((uint16_t)mRxBuf[2] | ((uint16_t)mRxBuf[3] << 8));
+                    slvPWM = (int16_t)((uint16_t)mRxBuf[4] | ((uint16_t)mRxBuf[5] << 8));
+                    slvESC = (uint16_t)((uint16_t)mRxBuf[6] | ((uint16_t)mRxBuf[7] << 8));
+                }
+            }
         }
     }
 }
 
-static void masterRequestTelem() {
-    // Enviar solicitud (0xFFFF big‑endian)
-    Serial.write(0xFF);
-    Serial.write(0xFF);
+// --- Slave: parser no-bloqueante de comandos (3 bytes) ---
+static uint8_t sRxBuf[2];
+static uint8_t sRxIdx = 0;
+static uint8_t sRxCmd = 0;
+static bool    sRxActive = false;
 
-    // Leer respuesta de 8 bytes con timeout de 2 ms
-    Serial.setTimeout(2);
-    uint8_t buf[8];
-    if (Serial.readBytes(buf, 8) == 8) {
-        slaveRPM   = (int16_t)((uint16_t)buf[0] | ((uint16_t)buf[1] << 8));
-        slaveHz100 = (uint16_t)((uint16_t)buf[2] | ((uint16_t)buf[3] << 8));
-        slavePWM   = (int16_t)((uint16_t)buf[4] | ((uint16_t)buf[5] << 8));
-        slaveESC   = (uint16_t)((uint16_t)buf[6] | ((uint16_t)buf[7] << 8));
+static void slaveParseUART() {
+    while (Serial.available()) {
+        uint8_t b = Serial.read();
+        if (!sRxActive) {
+            // Bytes de comando: 0xA1..0xA5
+            if (b >= UCMD_DC && b <= UCMD_MODE_AC) {
+                sRxCmd = b;
+                sRxActive = true;
+                sRxIdx = 0;
+            }
+        } else {
+            sRxBuf[sRxIdx++] = b;
+            if (sRxIdx == 2) {
+                sRxActive = false;
+                int16_t val = (int16_t)(((uint16_t)sRxBuf[0] << 8) | sRxBuf[1]);
+
+                switch (sRxCmd) {
+                    case UCMD_DC:
+                        if (mode == DC) motorSet(val);
+                        break;
+                    case UCMD_AC:
+                        if (mode == AC) {
+                            escArm();
+                            escSet((uint16_t)val);
+                        }
+                        break;
+                    case UCMD_STOP:
+                        motorSet(0);
+                        escStop();
+                        break;
+                    case UCMD_MODE_DC:
+                        motorSet(0);
+                        escStop();
+                        mode = DC;
+                        break;
+                    case UCMD_MODE_AC:
+                        motorSet(0);
+                        escStop();
+                        mode = AC;
+                        break;
+                }
+            }
+        }
     }
 }
 
-// ============================================================================
-// SPI — MASTER → ESP32
-// ============================================================================
-static uint8_t spiRxBuf[22];  // Respuesta del ESP32 (3 bytes útiles)
+// --- Slave: push telemetría periódica ---
+static unsigned long slavePushT = 0;
+
+static void slavePushTelem() {
+    unsigned long now = millis();
+    if (now - slavePushT < SLAVE_PUSH_MS) return;
+    slavePushT = now;
+
+    int16_t  rpm = getRPM();
+    uint16_t hz  = getHz100();
+
+    uint8_t pkt[10];
+    pkt[0] = UTELEM_HDR;
+    memcpy(&pkt[1], &rpm,      2);   // bytes 1-2: RPM (LE)
+    memcpy(&pkt[3], &hz,       2);   // bytes 3-4: Hz×100 (LE)
+    memcpy(&pkt[5], &localPWM, 2);   // bytes 5-6: PWM aplicado (LE)
+    memcpy(&pkt[7], &localESC, 2);   // bytes 7-8: ESC aplicado (LE)
+
+    uint8_t x = 0;
+    for (uint8_t i = 1; i <= 8; i++) x ^= pkt[i];
+    pkt[9] = x;
+
+    Serial.write(pkt, 10);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// § 12. SPI — MASTER → ESP32
+// ═══════════════════════════════════════════════════════════════════════
+
+static uint8_t spiRx[22];
 
 static void spiInit() {
     pinMode(SPI_CS_PIN, OUTPUT);
@@ -411,162 +434,141 @@ static void spiInit() {
     SPI.setBitOrder(MSBFIRST);
 }
 
-static void spiTransact(TelemetryPacket* pkt) {
-    pkt->checksum = 0;
+static void spiSend(TelemetryPacket* pkt) {
+    pkt->xor_chk = 0;
     uint8_t* raw = (uint8_t*)pkt;
     for (uint8_t i = 0; i < sizeof(TelemetryPacket) - 1; i++) {
-        pkt->checksum ^= raw[i];
+        pkt->xor_chk ^= raw[i];
     }
 
     digitalWrite(SPI_CS_PIN, LOW);
     for (uint8_t i = 0; i < sizeof(TelemetryPacket); i++) {
-        spiRxBuf[i] = SPI.transfer(raw[i]);
+        spiRx[i] = SPI.transfer(raw[i]);
     }
     digitalWrite(SPI_CS_PIN, HIGH);
 }
 
-// ============================================================================
-// PROCESAR COMANDO SPI (del ESP32)
-// ============================================================================
-static void processCommand(uint8_t cmd, int16_t val) {
+// ═══════════════════════════════════════════════════════════════════════
+// § 13. PROCESADOR DE COMANDOS (Master: SPI → local + UART → Slave)
+// ═══════════════════════════════════════════════════════════════════════
+
+static void processCmd(uint8_t cmd, int16_t val) {
     switch (cmd) {
-        case SPI_CMD_DC_BOTH:
-            if (currentMode != MODE_DC) break;
-            motorSetPWM(val);
-            if (val != lastSentDcToSlave) {
-                uartSendVal(val);
-                lastSentDcToSlave = val;
+        case CMD_DC_BOTH:
+            if (mode != DC) break;
+            motorSet(val);
+            if (val != lastFwdDC) {
+                uartSendCmd(UCMD_DC, val);
+                lastFwdDC = val;
             }
             break;
 
-        case SPI_CMD_AC_MASTER:
-            if (currentMode != MODE_AC) break;
-            escArmIfNeeded();
-            escSetUS((uint16_t)val);
-            uartSendVal(0);   // Apagar Slave
+        case CMD_AC_MASTER:
+            if (mode != AC) break;
+            escArm();
+            escSet((uint16_t)val);
+            uartSendCmd(UCMD_STOP, 0);
             break;
 
-        case SPI_CMD_AC_SLAVE:
-            if (currentMode != MODE_AC) break;
+        case CMD_AC_SLAVE:
+            if (mode != AC) break;
             escStop();
-            uartSendVal((uint16_t)val);
+            uartSendCmd(UCMD_AC, val);
             break;
 
-        case SPI_CMD_AC_BOTH:
-            if (currentMode != MODE_AC) break;
-            escArmIfNeeded();
-            escSetUS((uint16_t)val);
-            if ((uint16_t)val != lastSentAcToSlave) {
-                uartSendVal((uint16_t)val);
-                lastSentAcToSlave = (uint16_t)val;
+        case CMD_AC_BOTH:
+            if (mode != AC) break;
+            escArm();
+            escSet((uint16_t)val);
+            if ((uint16_t)val != lastFwdAC) {
+                uartSendCmd(UCMD_AC, val);
+                lastFwdAC = (uint16_t)val;
             }
             break;
 
-        case SPI_CMD_STOP_ALL:
-            motorSetPWM(0);
+        case CMD_STOP:
+            motorSet(0);
             escStop();
-            lastSentDcToSlave = -999;
-            lastSentAcToSlave = 0;
-            uartSendVal(0);   // STOP al Slave
+            lastFwdDC = -999;
+            lastFwdAC = 0;
+            uartSendCmd(UCMD_STOP, 0);
             break;
 
-        case SPI_CMD_MODE_DC:
-            motorSetPWM(0);
+        case CMD_MODE_DC:
+            motorSet(0);
             escStop();
-            lastSentDcToSlave = -999;
-            lastSentAcToSlave = 0;
-            currentMode = MODE_DC;
-            uartSendVal(UART_MODE_DC_VAL);
+            lastFwdDC = -999;
+            lastFwdAC = 0;
+            mode = DC;
+            uartSendCmd(UCMD_MODE_DC, 0);
             break;
 
-        case SPI_CMD_MODE_AC:
-            motorSetPWM(0);
+        case CMD_MODE_AC:
+            motorSet(0);
             escStop();
-            lastSentDcToSlave = -999;
-            lastSentAcToSlave = 0;
-            currentMode = MODE_AC;
-            uartSendVal(UART_MODE_AC_VAL);
-            break;
-
-        default:
+            lastFwdDC = -999;
+            lastFwdAC = 0;
+            mode = AC;
+            uartSendCmd(UCMD_MODE_AC, 0);
             break;
     }
 }
 
-// ============================================================================
-// SETUP
-// ============================================================================
+// ═══════════════════════════════════════════════════════════════════════
+// § 14. SETUP + LOOP
+// ═══════════════════════════════════════════════════════════════════════
+
 void setup() {
     pinMode(ROLE_PIN, INPUT_PULLUP);
     isMaster = (digitalRead(ROLE_PIN) == HIGH);
 
+    Serial.begin(115200);
     motorInit();
     encoderInit();
     bldcInit();
 
-    if (isMaster) {
-        Serial.begin(115200);
-        spiInit();
-    } else {
-        Serial.begin(115200);
-    }
+    if (isMaster) spiInit();
 }
 
-// ============================================================================
-// LOOP
-// ============================================================================
-static unsigned long lastTelemSend    = 0;
-static unsigned long lastSlaveRequest = 0;
+static unsigned long telemT = 0;
 
 void loop() {
-    // 1. Sensores según modo
-    if (currentMode == MODE_DC) {
-        encoderUpdate();
-    } else {
-        bldcUpdate();
-    }
+    // 1. Sensores — siempre, máxima frecuencia
+    encoderUpdate();
+    bldcUpdate();
 
-    // 2. UART: Slave escucha comandos, Master lee telemetría (solo si hay datos)
     if (isMaster) {
-        // Master: no procesa comandos UART entrantes (ya no los usa)
-        // Solo periodicamente solicita telemetría
-        unsigned long now = millis();
-        if ((now - lastSlaveRequest) >= SLAVE_TELEM_PUSH_MS) {
-            lastSlaveRequest = now;
-            masterRequestTelem();
-        }
-    } else {
-        // Slave: siempre procesa comandos entrantes
-        uartProcess();
-    }
+        // 2a. Leer telemetría del Slave (no-bloqueante)
+        masterParseUART();
 
-    // 3. Master: envío de telemetría al ESP32
-    if (isMaster) {
+        // 2b. Enviar telemetría al ESP32 + leer comando SPI
         unsigned long now = millis();
-        if ((now - lastTelemSend) >= TELEM_INTERVAL_MS) {
-            lastTelemSend = now;
+        if (now - telemT >= TELEM_SPI_MS) {
+            telemT = now;
 
             TelemetryPacket pkt;
-            pkt.startByte    = 0xAA;
-            pkt.timestamp_ms = now;
-            pkt.mPWM_applied = appliedPWM;
-            pkt.sPWM_applied = slavePWM;
-            pkt.mESC_applied = appliedESC;
-            pkt.sESC_applied = slaveESC;
-            pkt.mRPM         = (currentMode == MODE_DC) ? encoderGetRPM() : 0;
-            pkt.sRPM         = slaveRPM;
-            pkt.mHz          = (currentMode == MODE_AC) ? bldcGetHz100() : 0;
-            pkt.sHz          = slaveHz100;
+            pkt.start = 0xAA;
+            pkt.ts_ms = now;
+            pkt.mPWM  = localPWM;
+            pkt.sPWM  = slvPWM;
+            pkt.mESC  = localESC;
+            pkt.sESC  = slvESC;
+            pkt.mRPM  = getRPM();
+            pkt.sRPM  = slvRPM;
+            pkt.mHz   = getHz100();
+            pkt.sHz   = slvHz;
 
-            spiTransact(&pkt);
+            spiSend(&pkt);
 
-            // Leer comando SPI del ESP32
-            uint8_t cmd = spiRxBuf[0];
-            if (cmd != SPI_CMD_NONE) {
-                int16_t val = (int16_t)(((uint16_t)spiRxBuf[1] << 8) |
-                              spiRxBuf[2]);
-                processCommand(cmd, val);
+            // Procesar comando recibido del ESP32
+            if (spiRx[0] != CMD_NONE) {
+                int16_t val = (int16_t)(((uint16_t)spiRx[1] << 8) | spiRx[2]);
+                processCmd(spiRx[0], val);
             }
         }
+    } else {
+        // 3. Slave: parsear comandos + empujar telemetría
+        slaveParseUART();
+        slavePushTelem();
     }
 }
