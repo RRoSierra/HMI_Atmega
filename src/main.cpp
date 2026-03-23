@@ -2,7 +2,7 @@
  * @file main.cpp
  * @brief ATmega328P DAQ — Banco de Identificación de Sistemas
  * @author Atacama Dynamics
- * @version 5.0.0 — Selector de Modo DC/AC + Keepalive
+ * @version 5.1.0 — UART simplificado (sin keepalive, sin request/response)
  *
  * Firmware unificado Master/Slave (ROLE_PIN PD7).
  * Cero FSM, cero PID, cero JSON. Solo DAQ + escalones.
@@ -55,11 +55,8 @@
 // Intervalo de envío de telemetría (Master)
 #define TELEM_INTERVAL_MS  5  // 100 Hz al ESP32
 
-// Intervalo de request de telemetría al Slave
-#define SLAVE_REQ_MS    2     // 100 Hz
-
-// Keepalive: re-envío periódico de actuación al Slave
-#define SLAVE_KEEPALIVE_MS 2  // 20 Hz
+// Intervalo de envío de telemetría del Slave al Master
+#define SLAVE_TELEM_PUSH_MS  10  // 100 Hz push
 
 // ESC
 #define ESC_NEUTRAL     1500
@@ -82,8 +79,7 @@
 #define UART_CMD_SET_DC     0x7A  // + 2 bytes BE (int16_t PWM)
 #define UART_CMD_SET_AC     0x7B  // + 2 bytes BE (uint16_t µs)
 #define UART_CMD_STOP       0x7C  // sin payload
-#define UART_CMD_REQ_TELEM  0x7D  // sin payload → Slave responde 8 bytes
-#define UART_RSP_TELEM      0x7E  // + 8 bytes LE (RPM, Hz100, PWM, ESC)
+#define UART_TELEM_HEADER   0x7E  // Slave → Master: header + 8 bytes LE
 #define UART_CMD_MODE_DC    0x8A  // sin payload
 #define UART_CMD_MODE_AC    0x8B  // sin payload
 
@@ -122,9 +118,6 @@ static int16_t  slaveRPM      = 0;
 static uint16_t slaveHz100    = 0;
 static int16_t  slavePWM      = 0;
 static uint16_t slaveESC      = ESC_NEUTRAL;
-
-// --- Keepalive: último valor comandado al Slave ---
-static int16_t  slaveCmdDC    = 0;
 
 // --- Filtro de reenvío: evitar saturar al Slave ---
 static int16_t  lastSentDcToSlave = -999;
@@ -342,132 +335,84 @@ static void escStop() {
 }
 
 // ============================================================================
-// UART — COMUNICACIÓN MASTER ↔ SLAVE CON TIMEOUTS
+// UART — COMUNICACIÓN SIMPLIFICADA MASTER ↔ SLAVE
 // ============================================================================
+// Master → Slave: CMD + payload (fire & forget)
+// Slave → Master: Telemetría periódica push (sin request)
 
-// --- Slave: parseo de comandos entrantes del Master ---
+// --- Slave: parser simple ---
+static uint8_t  uartRxState = 0;  // 0=CMD, 1=HI, 2=LO
 static uint8_t  uartRxCmd = 0;
-static uint16_t uartRxVal = 0;
-static bool     uartRxReady = false;
-static bool     uartRxWaitPayload = false;
-static uint8_t  uartRxPayloadCmd = 0;
-static uint8_t  uartRxBuf[8];
-static uint8_t  uartRxIdx = 0;
-static uint8_t  uartRxExpected = 0;
-static unsigned long uartRxLastTime = 0; // Timeout Tracker Slave
+static uint8_t  uartRxHi = 0;
 
-// --- Master: respuesta de telemetría del Slave ---
-static bool     uartMasterWaitResp = false;
-static uint8_t  uartMasterRespBuf[8];
-static uint8_t  uartMasterRespIdx = 0;
-static uint8_t  uartMasterRespExpected = 0;
-static unsigned long uartMasterRespLastTime = 0; // Timeout Tracker Master
+// --- Master: parser de telemetría del Slave ---
+static uint8_t  uartMasterState = 0;  // 0=header, 1..8=datos
+static uint8_t  uartMasterBuf[8];
 
 static void uartPoll() {
-    unsigned long now = millis();
-
-    // FIX: Watchdog del Parser Master (Evita quedar bloqueado esperando un byte perdido)
-    if (isMaster && uartMasterWaitResp) {
-        if ((now - uartMasterRespLastTime) > 10) { // 10ms timeout
-            uartMasterWaitResp = false;
-        }
-    }
-
-    // FIX: Watchdog del Parser Slave (5ms timeout más agresivo)
-    if (!isMaster && uartRxWaitPayload) {
-        if ((now - uartRxLastTime) > 5) { // 5ms timeout
-            uartRxWaitPayload = false;
-        }
-    }
-
     while (Serial.available()) {
         uint8_t b = Serial.read();
 
         if (isMaster) {
-            // Master espera respuesta de telemetría del Slave
-            if (uartMasterWaitResp) {
-                uartMasterRespLastTime = now;
-                uartMasterRespBuf[uartMasterRespIdx++] = b;
-                
-                if (uartMasterRespIdx >= uartMasterRespExpected) {
-                    uartMasterWaitResp = false;
-                    // Parsear: RPM(2 LE) + Hz100(2 LE) + PWM(2 LE) + ESC(2 LE)
-                    slaveRPM   = (int16_t)((uint16_t)uartMasterRespBuf[0] |
-                                 ((uint16_t)uartMasterRespBuf[1] << 8));
-                    slaveHz100 = (uint16_t)((uint16_t)uartMasterRespBuf[2] |
-                                 ((uint16_t)uartMasterRespBuf[3] << 8));
-                    slavePWM   = (int16_t)((uint16_t)uartMasterRespBuf[4] |
-                                 ((uint16_t)uartMasterRespBuf[5] << 8));
-                    slaveESC   = (uint16_t)((uint16_t)uartMasterRespBuf[6] |
-                                 ((uint16_t)uartMasterRespBuf[7] << 8));
+            // Master: leer telemetría del Slave (header 0x7E + 8 bytes)
+            if (uartMasterState == 0) {
+                if (b == UART_TELEM_HEADER) uartMasterState = 1;
+            } else {
+                uartMasterBuf[uartMasterState - 1] = b;
+                uartMasterState++;
+                if (uartMasterState > 8) {
+                    uartMasterState = 0;
+                    slaveRPM   = (int16_t)((uint16_t)uartMasterBuf[0] | ((uint16_t)uartMasterBuf[1] << 8));
+                    slaveHz100 = (uint16_t)((uint16_t)uartMasterBuf[2] | ((uint16_t)uartMasterBuf[3] << 8));
+                    slavePWM   = (int16_t)((uint16_t)uartMasterBuf[4] | ((uint16_t)uartMasterBuf[5] << 8));
+                    slaveESC   = (uint16_t)((uint16_t)uartMasterBuf[6] | ((uint16_t)uartMasterBuf[7] << 8));
                 }
-            } else if (b == UART_RSP_TELEM) {
-                uartMasterWaitResp = true;
-                uartMasterRespIdx = 0;
-                uartMasterRespExpected = 8;
-                uartMasterRespLastTime = now;
             }
         } else {
             // Slave: parsear comandos del Master
-            if (uartRxWaitPayload) {
-                uartRxLastTime = now;
-                uartRxBuf[uartRxIdx++] = b;
-                if (uartRxIdx >= uartRxExpected) {
-                    uartRxWaitPayload = false;
-                    uartRxVal = ((uint16_t)uartRxBuf[0] << 8) | uartRxBuf[1];
-                    uartRxCmd = uartRxPayloadCmd;
-                    uartRxReady = true;
-                }
-            } else {
-                switch (b) {
-                    case UART_CMD_SET_DC:
-                    case UART_CMD_SET_AC:
-                        uartRxWaitPayload = true;
-                        uartRxPayloadCmd = b;
-                        uartRxIdx = 0;
-                        uartRxExpected = 2;
-                        uartRxLastTime = now;
-                        break;
-                    case UART_CMD_STOP:
-                        uartRxCmd = UART_CMD_STOP;
-                        uartRxVal = 0;
-                        uartRxReady = true;
-                        break;
-                    case UART_CMD_MODE_DC:
-                        uartRxCmd = UART_CMD_MODE_DC;
-                        uartRxVal = 0;
-                        uartRxReady = true;
-                        break;
-                    case UART_CMD_MODE_AC:
-                        uartRxCmd = UART_CMD_MODE_AC;
-                        uartRxVal = 0;
-                        uartRxReady = true;
-                        break;
-                    case UART_CMD_REQ_TELEM:
-                        // Slave responde inmediatamente con sus datos
-                        {
-                            int16_t  rpm   = encoderGetRPM();
-                            uint16_t hz100 = bldcGetHz100();
-                            Serial.write(UART_RSP_TELEM);
-                            Serial.write((uint8_t)(rpm & 0xFF));
-                            Serial.write((uint8_t)((rpm >> 8) & 0xFF));
-                            Serial.write((uint8_t)(hz100 & 0xFF));
-                            Serial.write((uint8_t)((hz100 >> 8) & 0xFF));
-                            Serial.write((uint8_t)(appliedPWM & 0xFF));
-                            Serial.write((uint8_t)((appliedPWM >> 8) & 0xFF));
-                            Serial.write((uint8_t)(appliedESC & 0xFF));
-                            Serial.write((uint8_t)((appliedESC >> 8) & 0xFF));
-                        }
-                        break;
-                    default:
-                        break;
+            switch (uartRxState) {
+                case 0:
+                    switch (b) {
+                        case UART_CMD_SET_DC:
+                        case UART_CMD_SET_AC:
+                            uartRxCmd = b;
+                            uartRxState = 1;
+                            break;
+                        case UART_CMD_STOP:
+                            motorSetPWM(0);
+                            escStop();
+                            break;
+                        case UART_CMD_MODE_DC:
+                            motorSetPWM(0); escStop();
+                            currentMode = MODE_DC;
+                            break;
+                        case UART_CMD_MODE_AC:
+                            motorSetPWM(0); escStop();
+                            currentMode = MODE_AC;
+                            break;
+                    }
+                    break;
+                case 1:
+                    uartRxHi = b;
+                    uartRxState = 2;
+                    break;
+                case 2: {
+                    uint16_t val = ((uint16_t)uartRxHi << 8) | b;
+                    if (uartRxCmd == UART_CMD_SET_DC && currentMode == MODE_DC)
+                        motorSetPWM((int16_t)val);
+                    else if (uartRxCmd == UART_CMD_SET_AC && currentMode == MODE_AC) {
+                        if (val == 0) escStop();
+                        else { escArmIfNeeded(); escSetUS(val); }
+                    }
+                    uartRxState = 0;
+                    break;
                 }
             }
         }
     }
 }
 
-// Master: enviar comando al Slave
+// Master: enviar comando al Slave (fire & forget)
 static void uartSendDC(int16_t pwm) {
     uint16_t raw = (uint16_t)pwm;
     Serial.write(UART_CMD_SET_DC);
@@ -489,10 +434,19 @@ static void uartSendMode(TestMode mode) {
     Serial.write(mode == MODE_DC ? UART_CMD_MODE_DC : UART_CMD_MODE_AC);
 }
 
-static void uartRequestSlaveTelem() {
-    // Si quedó atascado, resetear antes de solicitar
-    uartMasterWaitResp = false;
-    Serial.write(UART_CMD_REQ_TELEM);
+// Slave: enviar telemetría al Master (push periódico)
+static void slaveSendTelem() {
+    int16_t  rpm   = encoderGetRPM();
+    uint16_t hz100 = bldcGetHz100();
+    Serial.write(UART_TELEM_HEADER);
+    Serial.write((uint8_t)(rpm & 0xFF));
+    Serial.write((uint8_t)((rpm >> 8) & 0xFF));
+    Serial.write((uint8_t)(hz100 & 0xFF));
+    Serial.write((uint8_t)((hz100 >> 8) & 0xFF));
+    Serial.write((uint8_t)(appliedPWM & 0xFF));
+    Serial.write((uint8_t)((appliedPWM >> 8) & 0xFF));
+    Serial.write((uint8_t)(appliedESC & 0xFF));
+    Serial.write((uint8_t)((appliedESC >> 8) & 0xFF));
 }
 
 // ============================================================================
@@ -536,7 +490,6 @@ static void processCommand(uint8_t cmd, int16_t val) {
         case SPI_CMD_DC_BOTH:
             if (currentMode != MODE_DC) break;  // Cross-lock
             motorSetPWM(val);
-            slaveCmdDC = val;
             if (val != lastSentDcToSlave) {
                 uartSendDC(val);
                 lastSentDcToSlave = val;
@@ -569,7 +522,6 @@ static void processCommand(uint8_t cmd, int16_t val) {
         case SPI_CMD_STOP_ALL:
             motorSetPWM(0);
             escStop();
-            slaveCmdDC = 0;           // Limpiar keepalive
             lastSentDcToSlave = -999; // Reset filtro
             lastSentAcToSlave = 0;
             uartSendStop();
@@ -578,7 +530,6 @@ static void processCommand(uint8_t cmd, int16_t val) {
         case SPI_CMD_MODE_DC:
             motorSetPWM(0);
             escStop();
-            slaveCmdDC = 0;
             lastSentDcToSlave = -999;
             lastSentAcToSlave = 0;
             currentMode = MODE_DC;
@@ -589,57 +540,11 @@ static void processCommand(uint8_t cmd, int16_t val) {
         case SPI_CMD_MODE_AC:
             motorSetPWM(0);
             escStop();
-            slaveCmdDC = 0;
             lastSentDcToSlave = -999;
             lastSentAcToSlave = 0;
             currentMode = MODE_AC;
             uartSendStop();
             uartSendMode(MODE_AC);
-            break;
-
-        default:
-            break;
-    }
-}
-
-// ============================================================================
-// SLAVE: PROCESAR COMANDO UART (del Master)
-// ============================================================================
-static void slaveProcessCommand() {
-    if (!uartRxReady) return;
-    uartRxReady = false;
-
-    switch (uartRxCmd) {
-        case UART_CMD_SET_DC:
-            if (currentMode == MODE_DC)  // Cross-lock
-                motorSetPWM((int16_t)uartRxVal);
-            break;
-
-        case UART_CMD_SET_AC:
-            if (currentMode != MODE_AC) break;  // Cross-lock
-            if (uartRxVal == 0) {
-                escStop();
-            } else {
-                escArmIfNeeded();
-                escSetUS(uartRxVal);
-            }
-            break;
-
-        case UART_CMD_STOP:
-            motorSetPWM(0);
-            escStop();
-            break;
-
-        case UART_CMD_MODE_DC:
-            motorSetPWM(0);
-            escStop();
-            currentMode = MODE_DC;
-            break;
-
-        case UART_CMD_MODE_AC:
-            motorSetPWM(0);
-            escStop();
-            currentMode = MODE_AC;
             break;
 
         default:
@@ -674,9 +579,8 @@ void setup() {
 // ============================================================================
 // LOOP
 // ============================================================================
-static unsigned long lastTelemSend  = 0;
-static unsigned long lastSlaveReq   = 0;
-static unsigned long lastKeepalive  = 0;
+static unsigned long lastTelemSend    = 0;
+static unsigned long lastSlaveTelPush = 0;
 
 void loop() {
     // 1. Sensores (exclusivos según modo)
@@ -695,21 +599,7 @@ void loop() {
         // =============================================
         unsigned long now = millis();
 
-        // 3. Pedir telemetría al Slave periódicamente
-        if ((now - lastSlaveReq) >= SLAVE_REQ_MS) {
-            lastSlaveReq = now;
-            uartRequestSlaveTelem();
-        }
-
-        // 3b. Keepalive: re-enviar actuación DC al Slave
-        if(currentMode == MODE_DC){
-          if ((now - lastKeepalive) >= SLAVE_KEEPALIVE_MS) {
-            lastKeepalive = now;
-            uartSendDC(slaveCmdDC);
-          }
-        }
-
-        // 4. Enviar TelemetryPacket al ESP32
+        // 3. Enviar TelemetryPacket al ESP32
         if ((now - lastTelemSend) >= TELEM_INTERVAL_MS) {
             lastTelemSend = now;
 
@@ -740,6 +630,10 @@ void loop() {
         // =============================================
         // SLAVE LOOP
         // =============================================
-        slaveProcessCommand();
+        unsigned long now = millis();
+        if ((now - lastSlaveTelPush) >= SLAVE_TELEM_PUSH_MS) {
+            lastSlaveTelPush = now;
+            slaveSendTelem();
+        }
     }
 }
