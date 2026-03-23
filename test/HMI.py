@@ -20,6 +20,7 @@ import struct
 import time
 import threading
 import csv
+import os
 from collections import deque
 from datetime import datetime
 
@@ -31,8 +32,15 @@ matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
+# Intento de importar Pillow para el Logo
+try:
+    from PIL import Image, ImageTk
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
 # ============================================================================
-# CONSTANTES DE PROTOCOLO
+# CONSTANTES DE PROTOCOLO Y UI
 # ============================================================================
 PKT_SIZE = 22
 PKT_START = 0xAA
@@ -45,13 +53,26 @@ CMD_AC_SLAVE   = 0x73
 CMD_AC_BOTH    = 0x75
 CMD_STOP_ALL   = 0x76
 
+# Paleta de colores Modern Light Flat (Soft UI)
+BG_MAIN  = "#FFFFFF"
+BG_PANEL = "#F8FAFC"
+BG_INPUT = "#FFFFFF"
+FG_TEXT  = "#1E293B"
+FG_DIM   = "#64748B"
+C_BORDER = "#E2E8F0"
+C_BLUE   = "#3B82F6"
+C_GREEN  = "#10B981"
+C_RED    = "#EF4444"
+C_ORANGE = "#F97316"
+C_CYAN   = "#06B6D4"
+
 
 class SysIdHMI:
     def __init__(self, root):
         self.root = root
         self.root.title("Atacama Dynamics - DAQ Identificación v4.0")
-        self.root.geometry("1200x800")
-        self.root.configure(bg="#1e1e1e")
+        self.root.geometry("1280x850")
+        self.root.configure(bg=BG_MAIN)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         # === Estado ===
@@ -106,290 +127,311 @@ class SysIdHMI:
         self.refresh_ports()
 
     # ================================================================
-    # UI SETUP
+    # UI SETUP (ESTILO LIGHT FLAT Y BORDES SUAVES)
     # ================================================================
+    def create_header(self):
+        header = tk.Frame(self.root, bg=BG_MAIN, height=80)
+        header.pack(side=tk.TOP, fill=tk.X, pady=(10, 10))
+        header.pack_propagate(False)
+
+        self.logo_lbl = tk.Label(header, bg=BG_MAIN)
+        self.logo_lbl.pack(side=tk.LEFT, padx=30, pady=5)
+        self._load_logo()
+
+        title_frame = tk.Frame(header, bg=BG_MAIN)
+        title_frame.pack(side=tk.LEFT, padx=20, pady=10)
+        tk.Label(title_frame, text="SISTEMA DAQ & IDENTIFICACIÓN",
+                 font=("Segoe UI", 18, "bold"), bg=BG_MAIN, fg=FG_TEXT).pack(anchor=tk.W)
+        tk.Label(title_frame, text="Banco de Pruebas de Lazo Abierto v4.0",
+                 font=("Segoe UI", 10), bg=BG_MAIN, fg=FG_DIM).pack(anchor=tk.W)
+
+    def _load_logo(self):
+        if not HAS_PIL:
+            self.logo_lbl.config(text="ATACAMA DYNAMICS", font=("Segoe UI", 16, "bold"), fg=C_BLUE)
+            return
+
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        possible_names = ["logo.png", "Captura-de-pantalla-2025-07-15-162232.png"]
+
+        for name in possible_names:
+            path = os.path.join(script_dir, name)
+            if os.path.exists(path):
+                try:
+                    img = Image.open(path)
+                    ratio = 55.0 / img.height
+                    new_size = (int(img.width * ratio), 55)
+                    img = img.resize(new_size, Image.Resampling.LANCZOS)
+                    self.logo_photo = ImageTk.PhotoImage(img)
+                    self.logo_lbl.config(image=self.logo_photo)
+                    return
+                except Exception as e:
+                    print(f"Error cargando logo: {e}")
+
+        self.logo_lbl.config(text="ATACAMA DYNAMICS", font=("Segoe UI", 16, "bold"), fg=C_BLUE)
+
+    def _create_flat_button(self, parent, text, bg_color, command, state=tk.NORMAL):
+        btn = tk.Button(parent, text=text, bg=bg_color, fg="white",
+                        font=("Segoe UI", 10, "bold"), command=command, state=state,
+                        relief=tk.FLAT, bd=0, activebackground=bg_color, activeforeground="white",
+                        cursor="hand2", pady=8, padx=10)
+        return btn
+
+    def _create_label_frame(self, parent, text, color=C_BLUE):
+        lf = tk.LabelFrame(parent, text=f" {text} ", bg=BG_PANEL, fg=color,
+                           font=("Segoe UI", 10, "bold"), bd=1, relief=tk.SOLID,
+                           highlightbackground=C_BORDER, highlightthickness=1, padx=15, pady=15)
+        return lf
+
     def setup_ui(self):
         style = ttk.Style()
-        style.theme_use("clam")
-        style.configure("TFrame", background="#1e1e1e")
-        style.configure("TLabel", background="#1e1e1e", foreground="#ffffff",
+        style.configure("TFrame", background=BG_MAIN)
+        style.configure("TLabel", background=BG_PANEL, foreground=FG_TEXT,
                          font=("Segoe UI", 10))
-        style.configure("TRadiobutton", background="#1e1e1e",
-                         foreground="#ffffff", font=("Segoe UI", 10))
+        style.configure("TRadiobutton", background=BG_PANEL,
+                         foreground=FG_TEXT, font=("Segoe UI", 10))
+
+        self.create_header()
+
+        main_frame = tk.Frame(self.root, bg=BG_MAIN)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 20))
 
         # --- PANEL IZQUIERDO ---
-        ctrl = ttk.Frame(self.root, padding="15")
-        ctrl.pack(side=tk.LEFT, fill=tk.Y)
-
-        ttk.Label(ctrl, text="DAQ IDENTIFICACIÓN v4.0",
-                  font=("Segoe UI", 13, "bold"),
-                  foreground="#4facfe").pack(pady=(0, 15))
+        ctrl = tk.Frame(main_frame, bg=BG_MAIN, width=340)
+        ctrl.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 20))
+        ctrl.pack_propagate(False)
 
         # ---- Conexión Serial ----
-        ttk.Label(ctrl, text="Puerto Serial:").pack(anchor=tk.W)
-        port_frame = ttk.Frame(ctrl)
-        port_frame.pack(fill=tk.X, pady=5)
+        conn_frame = self._create_label_frame(ctrl, "CONEXIÓN SERIAL")
+        conn_frame.pack(fill=tk.X, pady=(0, 10))
 
-        self.combo_port = ttk.Combobox(port_frame,
+        port_row = tk.Frame(conn_frame, bg=BG_PANEL)
+        port_row.pack(fill=tk.X, pady=5)
+
+        self.combo_port = ttk.Combobox(port_row,
                                         textvariable=self.selected_port,
                                         width=18, state="readonly",
                                         font=("Segoe UI", 10))
-        self.combo_port.pack(side=tk.LEFT, padx=(0, 5))
+        self.combo_port.pack(side=tk.LEFT, padx=(0, 10))
 
-        tk.Button(port_frame, text="⟳", command=self.refresh_ports,
-                  bg="#333", fg="white", font=("Segoe UI", 10),
-                  width=3).pack(side=tk.LEFT)
+        self._create_flat_button(port_row, "⟳", FG_DIM, self.refresh_ports).pack(side=tk.LEFT)
 
-        self.btn_connect = tk.Button(ctrl, text="CONECTAR",
-                                      bg="#3b82f6", fg="white",
-                                      font=("Segoe UI", 11, "bold"),
-                                      command=self.toggle_connection)
-        self.btn_connect.pack(fill=tk.X, pady=8)
+        self.btn_connect = self._create_flat_button(conn_frame, "CONECTAR", C_BLUE, self.toggle_connection)
+        self.btn_connect.pack(fill=tk.X, pady=10)
 
         # ---- Control DC ----
-        dc_frame = ttk.LabelFrame(ctrl, text="MOTOR DC (PWM -255 a 255)",
-                                   padding="8")
-        dc_frame.pack(fill=tk.X, pady=(10, 5))
+        dc_frame = self._create_label_frame(ctrl, "MOTOR DC (PWM -255 a 255)", C_BLUE)
+        dc_frame.pack(fill=tk.X, pady=10)
 
-        dc_input_row = ttk.Frame(dc_frame)
-        dc_input_row.pack(fill=tk.X, pady=2)
-        self.dc_entry = ttk.Entry(dc_input_row, textvariable=self.dc_entry_var,
-                                   width=6, font=("Segoe UI", 12))
-        self.dc_entry.pack(side=tk.LEFT, padx=(0, 5))
+        dc_input_row = tk.Frame(dc_frame, bg=BG_PANEL)
+        dc_input_row.pack(fill=tk.X, pady=5)
+        self.dc_entry = tk.Entry(dc_input_row, textvariable=self.dc_entry_var,
+                                 width=8, font=("Segoe UI", 14, "bold"),
+                                 bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT,
+                                 relief=tk.SOLID, bd=1, justify=tk.CENTER)
+        self.dc_entry.pack(side=tk.LEFT, padx=(0, 10))
         self.dc_entry.bind("<Return>", self._dc_entry_changed)
+        tk.Label(dc_input_row, text="(-255 a 255)", bg=BG_PANEL, fg=FG_DIM,
+                 font=("Segoe UI", 9)).pack(side=tk.LEFT)
 
         self.dc_slider = tk.Scale(dc_frame, from_=-255, to=255,
                                    orient=tk.HORIZONTAL,
-                                   bg="#1e1e1e", fg="white",
+                                   bg=BG_PANEL, fg=FG_TEXT,
                                    highlightthickness=0,
-                                   troughcolor="#333",
-                                   activebackground="#4facfe",
+                                   troughcolor=C_BORDER,
+                                   activebackground=C_BLUE,
                                    font=("Segoe UI", 8), showvalue=False,
                                    command=self._dc_slider_changed)
         self.dc_slider.set(0)
-        self.dc_slider.pack(fill=tk.X, pady=2)
+        self.dc_slider.pack(fill=tk.X, pady=10)
 
-        dc_btn_row = ttk.Frame(dc_frame)
-        dc_btn_row.pack(fill=tk.X, pady=2)
-        self.btn_dc_send = tk.Button(dc_btn_row, text="▶ ENVIAR DC",
-                                      bg="#4facfe", fg="white",
-                                      font=("Segoe UI", 10, "bold"),
-                                      command=self._send_dc,
-                                      state=tk.DISABLED)
-        self.btn_dc_send.pack(side=tk.LEFT, expand=True, fill=tk.X,
-                              padx=(0, 2))
-        self.btn_dc_stop = tk.Button(dc_btn_row, text="⏹ STOP DC",
-                                      bg="#ef4444", fg="white",
-                                      font=("Segoe UI", 10, "bold"),
-                                      command=self._stop_dc,
-                                      state=tk.DISABLED)
-        self.btn_dc_stop.pack(side=tk.LEFT, expand=True, fill=tk.X,
-                              padx=(2, 0))
+        dc_btn_row = tk.Frame(dc_frame, bg=BG_PANEL)
+        dc_btn_row.pack(fill=tk.X, pady=5)
+        self.btn_dc_send = self._create_flat_button(dc_btn_row, "▶ ENVIAR DC",
+                                                      C_BLUE, self._send_dc, state=tk.DISABLED)
+        self.btn_dc_send.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 4))
+        self.btn_dc_stop = self._create_flat_button(dc_btn_row, "⏹ STOP DC",
+                                                      C_RED, self._stop_dc, state=tk.DISABLED)
+        self.btn_dc_stop.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(4, 0))
 
         # ---- Control AC (ESC) ----
-        ac_frame = ttk.LabelFrame(ctrl, text="MOTOR AC / ESC (µs 1000-2000)",
-                                   padding="8")
-        ac_frame.pack(fill=tk.X, pady=5)
+        ac_frame = self._create_label_frame(ctrl, "MOTOR AC / ESC (µs 1000-2000)", C_ORANGE)
+        ac_frame.pack(fill=tk.X, pady=10)
 
-        ac_target_row = ttk.Frame(ac_frame)
-        ac_target_row.pack(fill=tk.X, pady=2)
+        ac_target_row = tk.Frame(ac_frame, bg=BG_PANEL)
+        ac_target_row.pack(fill=tk.X, pady=5)
         self.ac_target = tk.StringVar(value="AC_BOTH")
         for text, val in [("Ambos", "AC_BOTH"), ("Master", "AC_MASTER"),
                            ("Slave", "AC_SLAVE")]:
             ttk.Radiobutton(ac_target_row, text=text,
                             variable=self.ac_target,
-                            value=val).pack(side=tk.LEFT, padx=2)
+                            value=val).pack(side=tk.LEFT, padx=5)
 
-        ac_input_row = ttk.Frame(ac_frame)
-        ac_input_row.pack(fill=tk.X, pady=2)
-        self.ac_entry = ttk.Entry(ac_input_row, textvariable=self.ac_entry_var,
-                                   width=6, font=("Segoe UI", 12))
-        self.ac_entry.pack(side=tk.LEFT, padx=(0, 5))
+        ac_input_row = tk.Frame(ac_frame, bg=BG_PANEL)
+        ac_input_row.pack(fill=tk.X, pady=5)
+        self.ac_entry = tk.Entry(ac_input_row, textvariable=self.ac_entry_var,
+                                 width=8, font=("Segoe UI", 14, "bold"),
+                                 bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT,
+                                 relief=tk.SOLID, bd=1, justify=tk.CENTER)
+        self.ac_entry.pack(side=tk.LEFT, padx=(0, 10))
         self.ac_entry.bind("<Return>", self._ac_entry_changed)
+        tk.Label(ac_input_row, text="(1000-2000 µs)", bg=BG_PANEL, fg=FG_DIM,
+                 font=("Segoe UI", 9)).pack(side=tk.LEFT)
 
         self.ac_slider = tk.Scale(ac_frame, from_=1000, to=2000,
                                    orient=tk.HORIZONTAL,
-                                   bg="#1e1e1e", fg="white",
+                                   bg=BG_PANEL, fg=FG_TEXT,
                                    highlightthickness=0,
-                                   troughcolor="#333",
-                                   activebackground="#f97316",
+                                   troughcolor=C_BORDER,
+                                   activebackground=C_ORANGE,
                                    font=("Segoe UI", 8), showvalue=False,
                                    command=self._ac_slider_changed)
         self.ac_slider.set(1500)
-        self.ac_slider.pack(fill=tk.X, pady=2)
+        self.ac_slider.pack(fill=tk.X, pady=10)
 
-        ac_btn_row = ttk.Frame(ac_frame)
-        ac_btn_row.pack(fill=tk.X, pady=2)
-        self.btn_ac_send = tk.Button(ac_btn_row, text="▶ ENVIAR AC",
-                                      bg="#f97316", fg="white",
-                                      font=("Segoe UI", 10, "bold"),
-                                      command=self._send_ac,
-                                      state=tk.DISABLED)
-        self.btn_ac_send.pack(side=tk.LEFT, expand=True, fill=tk.X,
-                              padx=(0, 2))
-        self.btn_ac_stop = tk.Button(ac_btn_row, text="⏹ STOP AC",
-                                      bg="#ef4444", fg="white",
-                                      font=("Segoe UI", 10, "bold"),
-                                      command=self._stop_ac,
-                                      state=tk.DISABLED)
-        self.btn_ac_stop.pack(side=tk.LEFT, expand=True, fill=tk.X,
-                              padx=(2, 0))
+        ac_btn_row = tk.Frame(ac_frame, bg=BG_PANEL)
+        ac_btn_row.pack(fill=tk.X, pady=5)
+        self.btn_ac_send = self._create_flat_button(ac_btn_row, "▶ ENVIAR AC",
+                                                      C_ORANGE, self._send_ac, state=tk.DISABLED)
+        self.btn_ac_send.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 4))
+        self.btn_ac_stop = self._create_flat_button(ac_btn_row, "⏹ STOP AC",
+                                                      C_RED, self._stop_ac, state=tk.DISABLED)
+        self.btn_ac_stop.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(4, 0))
 
         # ---- Grabación CSV ----
-        rec_frame = ttk.LabelFrame(ctrl, text="GRABACIÓN", padding="8")
-        rec_frame.pack(fill=tk.X, pady=5)
+        rec_frame = self._create_label_frame(ctrl, "GRABACIÓN", C_GREEN)
+        rec_frame.pack(fill=tk.X, pady=10)
 
-        self.btn_rec = tk.Button(rec_frame, text="⏺ GRABAR CSV",
-                                  bg="#22c55e", fg="white",
-                                  font=("Segoe UI", 10, "bold"),
-                                  command=self._toggle_recording,
-                                  state=tk.DISABLED)
+        self.btn_rec = self._create_flat_button(rec_frame, "⏺ GRABAR CSV",
+                                                  C_GREEN, self._toggle_recording, state=tk.DISABLED)
         self.btn_rec.pack(fill=tk.X)
 
-        self.btn_stop_all = tk.Button(rec_frame, text="⏹ STOP TODO",
-                                       bg="#ef4444", fg="white",
-                                       font=("Segoe UI", 11, "bold"),
-                                       command=self._stop_all,
-                                       state=tk.DISABLED)
-        self.btn_stop_all.pack(fill=tk.X, pady=(5, 0))
+        self.btn_stop_all = self._create_flat_button(rec_frame, "⏹ STOP TODO",
+                                                       C_RED, self._stop_all, state=tk.DISABLED)
+        self.btn_stop_all.pack(fill=tk.X, pady=(10, 0))
 
         # ---- Indicadores ----
-        self.lbl_status = ttk.Label(ctrl, text="DESCONECTADO",
-                                     foreground="#ef4444",
-                                     font=("Segoe UI", 10, "bold"))
+        self.lbl_status = tk.Label(ctrl, text="DESCONECTADO",
+                                    font=("Segoe UI", 11, "bold"),
+                                    bg=BG_MAIN, fg=C_RED)
         self.lbl_status.pack(side=tk.BOTTOM, pady=10)
 
-        self.lbl_warning = tk.Label(ctrl, text="", bg="#1e1e1e",
-                                     fg="#ef4444",
-                                     font=("Segoe UI", 14, "bold"),
-                                     wraplength=250)
+        self.lbl_warning = tk.Label(ctrl, text="", bg=BG_MAIN,
+                                     fg=C_RED,
+                                     font=("Segoe UI", 12, "bold"),
+                                     wraplength=280)
         self.lbl_warning.pack(side=tk.BOTTOM, pady=5)
 
         # ---- Telemetría en Vivo ----
-        live_frame = ttk.LabelFrame(ctrl, text="TELEMETRÍA EN VIVO",
-                                     padding="8")
+        live_frame = self._create_label_frame(ctrl, "TELEMETRÍA EN VIVO", C_CYAN)
         live_frame.pack(fill=tk.X, pady=(10, 0))
 
-        self.lbl_live_ts   = ttk.Label(live_frame, text="t(ms): ---",
-                                        font=("Consolas", 9))
+        self.lbl_live_ts   = tk.Label(live_frame, text="t(ms): ---",
+                                       bg=BG_PANEL, fg=FG_TEXT, font=("Consolas", 9))
         self.lbl_live_ts.pack(anchor=tk.W)
-        self.lbl_live_mPWM = ttk.Label(live_frame, text="M PWM: ---",
-                                        font=("Consolas", 9))
+        self.lbl_live_mPWM = tk.Label(live_frame, text="M PWM: ---",
+                                       bg=BG_PANEL, fg=FG_TEXT, font=("Consolas", 9))
         self.lbl_live_mPWM.pack(anchor=tk.W)
-        self.lbl_live_sPWM = ttk.Label(live_frame, text="S PWM: ---",
-                                        font=("Consolas", 9))
+        self.lbl_live_sPWM = tk.Label(live_frame, text="S PWM: ---",
+                                       bg=BG_PANEL, fg=FG_TEXT, font=("Consolas", 9))
         self.lbl_live_sPWM.pack(anchor=tk.W)
-        self.lbl_live_mESC = ttk.Label(live_frame, text="M ESC: ---",
-                                        font=("Consolas", 9))
+        self.lbl_live_mESC = tk.Label(live_frame, text="M ESC: ---",
+                                       bg=BG_PANEL, fg=FG_TEXT, font=("Consolas", 9))
         self.lbl_live_mESC.pack(anchor=tk.W)
-        self.lbl_live_sESC = ttk.Label(live_frame, text="S ESC: ---",
-                                        font=("Consolas", 9))
+        self.lbl_live_sESC = tk.Label(live_frame, text="S ESC: ---",
+                                       bg=BG_PANEL, fg=FG_TEXT, font=("Consolas", 9))
         self.lbl_live_sESC.pack(anchor=tk.W)
-        self.lbl_live_mRPM = ttk.Label(live_frame, text="M RPM: ---",
-                                        font=("Consolas", 9))
+        self.lbl_live_mRPM = tk.Label(live_frame, text="M RPM: ---",
+                                       bg=BG_PANEL, fg=FG_TEXT, font=("Consolas", 9))
         self.lbl_live_mRPM.pack(anchor=tk.W)
-        self.lbl_live_sRPM = ttk.Label(live_frame, text="S RPM: ---",
-                                        font=("Consolas", 9))
+        self.lbl_live_sRPM = tk.Label(live_frame, text="S RPM: ---",
+                                       bg=BG_PANEL, fg=FG_TEXT, font=("Consolas", 9))
         self.lbl_live_sRPM.pack(anchor=tk.W)
-        self.lbl_live_mHz  = ttk.Label(live_frame, text="M Hz:  ---",
-                                        font=("Consolas", 9))
+        self.lbl_live_mHz  = tk.Label(live_frame, text="M Hz:  ---",
+                                       bg=BG_PANEL, fg=FG_TEXT, font=("Consolas", 9))
         self.lbl_live_mHz.pack(anchor=tk.W)
-        self.lbl_live_sHz  = ttk.Label(live_frame, text="S Hz:  ---",
-                                        font=("Consolas", 9))
+        self.lbl_live_sHz  = tk.Label(live_frame, text="S Hz:  ---",
+                                       bg=BG_PANEL, fg=FG_TEXT, font=("Consolas", 9))
         self.lbl_live_sHz.pack(anchor=tk.W)
 
         # ---- Estadísticas ----
-        stats_frame = ttk.LabelFrame(ctrl, text="ESTADÍSTICAS", padding="8")
+        stats_frame = self._create_label_frame(ctrl, "ESTADÍSTICAS", C_BLUE)
         stats_frame.pack(fill=tk.X, pady=(5, 0))
-        self.lbl_pkt_count = ttk.Label(stats_frame, text="Paquetes: 0",
-                                        font=("Consolas", 9))
+        self.lbl_pkt_count = tk.Label(stats_frame, text="Paquetes: 0",
+                                       bg=BG_PANEL, fg=FG_TEXT, font=("Consolas", 9))
         self.lbl_pkt_count.pack(anchor=tk.W)
-        self.lbl_pkt_errors = ttk.Label(stats_frame, text="Errores:  0",
-                                         font=("Consolas", 9))
+        self.lbl_pkt_errors = tk.Label(stats_frame, text="Errores:  0",
+                                        bg=BG_PANEL, fg=FG_TEXT, font=("Consolas", 9))
         self.lbl_pkt_errors.pack(anchor=tk.W)
-        self.lbl_pkt_rate = ttk.Label(stats_frame, text="Rate:     --- Hz",
-                                       font=("Consolas", 9))
+        self.lbl_pkt_rate = tk.Label(stats_frame, text="Rate:     --- Hz",
+                                      bg=BG_PANEL, fg=C_BLUE, font=("Consolas", 9, "bold"))
         self.lbl_pkt_rate.pack(anchor=tk.W)
 
         # --- PANEL DERECHO: GRÁFICOS (4 subplots) ---
-        graph_frame = ttk.Frame(self.root, padding="10")
+        graph_frame = tk.Frame(main_frame, bg=BG_MAIN, bd=1, relief=tk.SOLID,
+                               highlightbackground=C_BORDER)
         graph_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
         self.fig, ((self.ax_dc, self.ax_ac),
                    (self.ax_rpm, self.ax_hz)) = plt.subplots(
-            2, 2, facecolor="#1e1e1e",
-            gridspec_kw={"hspace": 0.35, "wspace": 0.30})
+            2, 2, facecolor=BG_MAIN,
+            gridspec_kw={"hspace": 0.40, "wspace": 0.30})
+
+        self.fig.patch.set_facecolor(BG_MAIN)
+
+        def style_ax(ax, title, ylabel, xlabel="Tiempo (s)"):
+            ax.set_facecolor(BG_PANEL)
+            ax.tick_params(colors=FG_TEXT, labelsize=8)
+            ax.xaxis.label.set_color(FG_TEXT)
+            ax.yaxis.label.set_color(FG_TEXT)
+            ax.title.set_color(FG_TEXT)
+            ax.title.set_fontsize(11)
+            ax.title.set_weight("bold")
+            ax.set_title(title)
+            ax.set_ylabel(ylabel, fontsize=9)
+            ax.set_xlabel(xlabel, fontsize=9)
+            ax.grid(True, color=C_BORDER, linestyle="-", linewidth=0.5)
+            for spine in ax.spines.values():
+                spine.set_color("#CBD5E1")
+
+        style_ax(self.ax_dc, "Actuación DC (PWM)", "PWM (-255..255)", "")
+        style_ax(self.ax_ac, "Actuación AC (ESC µs)", "µs (1000-2000)", "")
+        style_ax(self.ax_rpm, "Medición RPM", "RPM")
+        style_ax(self.ax_hz, "Medición Hz (BLDC)", "Hz")
 
         # --- Subplot 1: Actuación DC (PWM applied) ---
-        self.ax_dc.set_facecolor("#252526")
-        self.ax_dc.tick_params(colors="white")
-        self.ax_dc.yaxis.label.set_color("white")
-        self.ax_dc.title.set_color("white")
-        self.line_mPWM, = self.ax_dc.plot([], [], color="#4facfe",
+        self.line_mPWM, = self.ax_dc.plot([], [], color=C_BLUE,
                                            linewidth=1.5, label="M PWM")
-        self.line_sPWM, = self.ax_dc.plot([], [], color="#22c55e",
+        self.line_sPWM, = self.ax_dc.plot([], [], color=C_GREEN,
                                            linewidth=1.5, label="S PWM")
-        self.ax_dc.set_title("Actuación DC (PWM)")
-        self.ax_dc.set_ylabel("PWM (-255..255)")
-        self.ax_dc.legend(facecolor="#1e1e1e", edgecolor="#1e1e1e",
-                          labelcolor="white", loc="upper right",
-                          fontsize=8)
-        self.ax_dc.grid(True, color="#333333", linestyle="--")
+        self.ax_dc.legend(facecolor=BG_MAIN, edgecolor=C_BORDER,
+                          labelcolor=FG_TEXT, loc="upper right", fontsize=8)
 
         # --- Subplot 2: Actuación AC (ESC µs) ---
-        self.ax_ac.set_facecolor("#252526")
-        self.ax_ac.tick_params(colors="white")
-        self.ax_ac.yaxis.label.set_color("white")
-        self.ax_ac.title.set_color("white")
-        self.line_mESC, = self.ax_ac.plot([], [], color="#a855f7",
+        self.line_mESC, = self.ax_ac.plot([], [], color=C_ORANGE,
                                            linewidth=1.5, label="M ESC")
-        self.line_sESC, = self.ax_ac.plot([], [], color="#f97316",
+        self.line_sESC, = self.ax_ac.plot([], [], color="#FBBF24",
                                            linewidth=1.5, label="S ESC")
-        self.ax_ac.set_title("Actuación AC (ESC µs)")
-        self.ax_ac.set_ylabel("µs (1000-2000)")
-        self.ax_ac.legend(facecolor="#1e1e1e", edgecolor="#1e1e1e",
-                          labelcolor="white", loc="upper right",
-                          fontsize=8)
-        self.ax_ac.grid(True, color="#333333", linestyle="--")
+        self.ax_ac.legend(facecolor=BG_MAIN, edgecolor=C_BORDER,
+                          labelcolor=FG_TEXT, loc="upper right", fontsize=8)
 
         # --- Subplot 3: Medición RPM ---
-        self.ax_rpm.set_facecolor("#252526")
-        self.ax_rpm.tick_params(colors="white")
-        self.ax_rpm.xaxis.label.set_color("white")
-        self.ax_rpm.yaxis.label.set_color("white")
-        self.ax_rpm.title.set_color("white")
-        self.line_mRPM, = self.ax_rpm.plot([], [], color="#4facfe",
+        self.line_mRPM, = self.ax_rpm.plot([], [], color=C_BLUE,
                                             linewidth=1.5, label="M RPM")
-        self.line_sRPM, = self.ax_rpm.plot([], [], color="#22c55e",
+        self.line_sRPM, = self.ax_rpm.plot([], [], color=C_GREEN,
                                             linewidth=1.5, label="S RPM")
-        self.ax_rpm.set_title("Medición RPM")
-        self.ax_rpm.set_xlabel("Tiempo (s)")
-        self.ax_rpm.set_ylabel("RPM")
-        self.ax_rpm.legend(facecolor="#1e1e1e", edgecolor="#1e1e1e",
-                           labelcolor="white", loc="upper right",
-                           fontsize=8)
-        self.ax_rpm.grid(True, color="#333333", linestyle="--")
+        self.ax_rpm.legend(facecolor=BG_MAIN, edgecolor=C_BORDER,
+                           labelcolor=FG_TEXT, loc="upper right", fontsize=8)
 
         # --- Subplot 4: Medición Hz ---
-        self.ax_hz.set_facecolor("#252526")
-        self.ax_hz.tick_params(colors="white")
-        self.ax_hz.xaxis.label.set_color("white")
-        self.ax_hz.yaxis.label.set_color("white")
-        self.ax_hz.title.set_color("white")
-        self.line_mHz, = self.ax_hz.plot([], [], color="#fbbf24",
+        self.line_mHz, = self.ax_hz.plot([], [], color=C_ORANGE,
                                           linewidth=1.5, label="M Hz")
-        self.line_sHz, = self.ax_hz.plot([], [], color="#f472b6",
+        self.line_sHz, = self.ax_hz.plot([], [], color="#FBBF24",
                                           linewidth=1.5, label="S Hz")
-        self.ax_hz.set_title("Medición Hz (BLDC)")
-        self.ax_hz.set_xlabel("Tiempo (s)")
-        self.ax_hz.set_ylabel("Hz")
-        self.ax_hz.legend(facecolor="#1e1e1e", edgecolor="#1e1e1e",
-                          labelcolor="white", loc="upper right",
-                          fontsize=8)
-        self.ax_hz.grid(True, color="#333333", linestyle="--")
+        self.ax_hz.legend(facecolor=BG_MAIN, edgecolor=C_BORDER,
+                          labelcolor=FG_TEXT, loc="upper right", fontsize=8)
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=graph_frame)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
     # ================================================================
     # SERIAL
@@ -425,13 +467,13 @@ class SysIdHMI:
                                                    daemon=True)
             self.serial_thread.start()
 
-            self.btn_connect.config(text="DESCONECTAR", bg="#ef4444")
+            self.btn_connect.config(text="DESCONECTAR", bg=C_RED)
             for btn in (self.btn_dc_send, self.btn_dc_stop,
                         self.btn_ac_send, self.btn_ac_stop,
                         self.btn_rec, self.btn_stop_all):
                 btn.config(state=tk.NORMAL)
             self.lbl_status.config(text=f"CONECTADO: {port}",
-                                    foreground="#22c55e")
+                                    fg=C_GREEN)
             self.lbl_warning.config(text="")
 
             self.check_watchdog()
@@ -451,12 +493,12 @@ class SysIdHMI:
         self.connection_ok = False
         self.dc_active = False
         self.ac_active = False
-        self.btn_connect.config(text="CONECTAR", bg="#3b82f6")
+        self.btn_connect.config(text="CONECTAR", bg=C_BLUE)
         for btn in (self.btn_dc_send, self.btn_dc_stop,
                     self.btn_ac_send, self.btn_ac_stop,
                     self.btn_rec, self.btn_stop_all):
             btn.config(state=tk.DISABLED)
-        self.lbl_status.config(text="DESCONECTADO", foreground="#ef4444")
+        self.lbl_status.config(text="DESCONECTADO", fg=C_RED)
 
     def serial_reader(self):
         """Hilo de lectura Serial. Lee tramas binarias de 22 bytes."""
@@ -598,7 +640,7 @@ class SysIdHMI:
             self.connection_ok = False
             self.lbl_warning.config(
                 text="⚠ SIN DATOS DEL ATmega\n(REVISA SPI/USB/BATERÍA)",
-                fg="#ef4444")
+                fg=C_RED)
         elif elapsed <= 2.0:
             self.lbl_warning.config(text="")
         self.root.after(500, self.check_watchdog)
@@ -653,7 +695,7 @@ class SysIdHMI:
         self.send_command(CMD_DC_BOTH, val)
         self.dc_active = val != 0
         self.lbl_status.config(text=f"DC ACTIVO: PWM={val}",
-                                foreground="#4facfe")
+                                fg=C_BLUE)
 
     def _stop_dc(self):
         self.send_command(CMD_DC_BOTH, 0)
@@ -661,7 +703,7 @@ class SysIdHMI:
         self.dc_value.set(0)
         self.dc_slider.set(0)
         self.dc_entry_var.set("0")
-        self.lbl_status.config(text="DC DETENIDO", foreground="#4facfe")
+        self.lbl_status.config(text="DC DETENIDO", fg=C_BLUE)
 
     # ---- AC (ESC) control ----
     def _send_ac(self):
@@ -676,7 +718,7 @@ class SysIdHMI:
         self.send_command(cmd_map[target], val)
         self.ac_active = val != 1500
         self.lbl_status.config(text=f"AC ACTIVO ({target}): {val}µs",
-                                foreground="#f97316")
+                                fg=C_ORANGE)
 
     def _stop_ac(self):
         target = self.ac_target.get()
@@ -690,7 +732,7 @@ class SysIdHMI:
         self.ac_value.set(1500)
         self.ac_slider.set(1500)
         self.ac_entry_var.set("1500")
-        self.lbl_status.config(text="AC DETENIDO", foreground="#f97316")
+        self.lbl_status.config(text="AC DETENIDO", fg=C_ORANGE)
 
     # ---- Stop all ----
     def _stop_all(self):
@@ -703,7 +745,7 @@ class SysIdHMI:
         self.ac_value.set(1500)
         self.ac_slider.set(1500)
         self.ac_entry_var.set("1500")
-        self.lbl_status.config(text="TODO DETENIDO", foreground="#22c55e")
+        self.lbl_status.config(text="TODO DETENIDO", fg=C_GREEN)
         if self.is_recording:
             self._stop_recording()
 
@@ -717,12 +759,12 @@ class SysIdHMI:
     def _start_recording(self):
         self.is_recording = True
         self.data_log = []
-        self.btn_rec.config(text="⏹ DETENER GRABACIÓN", bg="#ef4444")
-        self.lbl_status.config(text="GRABANDO...", foreground="#f97316")
+        self.btn_rec.config(text="⏹ DETENER GRABACIÓN", bg=C_RED)
+        self.lbl_status.config(text="GRABANDO...", fg=C_ORANGE)
 
     def _stop_recording(self):
         self.is_recording = False
-        self.btn_rec.config(text="⏺ GRABAR CSV", bg="#22c55e")
+        self.btn_rec.config(text="⏺ GRABAR CSV", bg=C_GREEN)
 
         if self.data_log:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
