@@ -83,6 +83,7 @@ class SysIdHMI:
         self.data_log = []
         self.last_rx_time = 0
         self.connection_ok = False
+        self._closing = False
 
         # Variables Tk
         self.selected_port = tk.StringVar()
@@ -614,6 +615,8 @@ class SysIdHMI:
 
     def _update_live_panel(self):
         """Actualiza indicadores numéricos de telemetría."""
+        if self._closing:
+            return
         self.lbl_live_ts.config(text=f"t(ms): {self.last_ts_ms}")
         self.lbl_live_mPWM.config(text=f"M PWM: {self.last_mPWM}")
         self.lbl_live_sPWM.config(text=f"S PWM: {self.last_sPWM}")
@@ -634,7 +637,7 @@ class SysIdHMI:
 
     def check_watchdog(self):
         """Watchdog del HMI: si no llegan datos en 2s, alertar."""
-        if not self.serial_running:
+        if not self.serial_running or self._closing:
             return
         elapsed = time.time() - self.last_rx_time
         if elapsed > 2.0 and self.connection_ok:
@@ -791,7 +794,7 @@ class SysIdHMI:
     # GRÁFICO EN VIVO
     # ================================================================
     def _update_live_graph(self):
-        if not self.serial_running:
+        if not self.serial_running or self._closing:
             return
         if len(self.live_times) >= 2:
             times = list(self.live_times)
@@ -853,6 +856,9 @@ class SysIdHMI:
     # CLEANUP
     # ================================================================
     def on_close(self):
+        if self._closing:
+            return
+        self._closing = True
         self.serial_running = False
         if self.ser and self.ser.is_open:
             try:
@@ -860,6 +866,9 @@ class SysIdHMI:
             except Exception:
                 pass
             self.ser.close()
+        if self.serial_thread and self.serial_thread.is_alive():
+            self.serial_thread.join(timeout=1.0)
+        plt.close('all')
         self.root.destroy()
 
 

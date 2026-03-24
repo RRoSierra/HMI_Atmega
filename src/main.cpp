@@ -52,13 +52,13 @@
 #define SPI_CS_PIN      10   // PB2 — CS del ESP32
 
 // Intervalo de envío de telemetría (Master)
-#define TELEM_INTERVAL_MS  10  // 100 Hz al ESP32
+#define TELEM_INTERVAL_MS  15  // 100 Hz al ESP32
 
 // Intervalo de request de telemetría al Slave
-#define SLAVE_REQ_MS    10     // 100 Hz
+#define SLAVE_REQ_MS    15    // 100 Hz
 
 // Keepalive: re-envío periódico de actuación al Slave
-#define SLAVE_KEEPALIVE_MS 30  // 20 Hz
+#define SLAVE_KEEPALIVE_MS 2  // 20 Hz
 
 // ESC
 #define ESC_NEUTRAL     1500
