@@ -441,7 +441,8 @@ class SysIdHMI:
         port_list = [p.device for p in ports]
         self.combo_port["values"] = port_list
         if port_list:
-            self.selected_port.set(port_list[0])
+            preferred = next((p for p in port_list if "ttyUSB0" in p or "ttyUSB1" in p), port_list[0])
+            self.selected_port.set(preferred)
 
     def toggle_connection(self):
         if self.ser and self.ser.is_open:
@@ -748,6 +749,7 @@ class SysIdHMI:
         self.lbl_status.config(text="TODO DETENIDO", fg=C_GREEN)
         if self.is_recording:
             self._stop_recording()
+        self.root.after(500, self.on_close)
 
     # ---- Recording ----
     def _toggle_recording(self):
