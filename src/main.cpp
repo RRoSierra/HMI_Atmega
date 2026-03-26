@@ -30,6 +30,7 @@
 #define EN_PIN          5    // PD5 — PWM enable
 #define IN1_PIN         A3   // PC3 — dirección A
 #define IN2_PIN         A2   // PC2 — dirección B
+#define RELE_PIN         8
 
 // Motor Brushless (ESC)
 #define ESC_PIN         4    // PD4 — señal PWM al ESC
@@ -573,7 +574,8 @@ void setup() {
     // Determinar rol
     pinMode(ROLE_PIN, INPUT_PULLUP);
     isMaster = (digitalRead(ROLE_PIN) == HIGH);
-
+    pinMode(RELE_PIN,OUTPUT);
+    digitalWrite(RELE_PIN,HIGH);
     // Hardware común
     motorInit();
     encoderInit();
