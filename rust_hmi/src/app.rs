@@ -7,11 +7,11 @@
 // ============================================================================
 
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use egui::{Color32, RichText, Rounding, Stroke};
-use egui_plot::{Legend, Line, Plot, PlotBounds, PlotPoints};
+use egui_plot::{Legend, Line, LineStyle, Plot, PlotBounds, PlotPoints, VLine};
 
 use crate::protocol::*;
 use crate::serial_comm::*;
@@ -33,6 +33,29 @@ const C_YELLOW: Color32 = Color32::from_rgb(0xFB, 0xBF, 0x24);
 
 const LIVE_BUFFER_SIZE: usize = 6000;
 const SIDE_PANEL_WIDTH: f32 = 350.0;
+
+// ============================================================================
+// ToF CALIBRATION CONSTANTS
+// ============================================================================
+const TOF_ARM_DURATION_MS: u64 = 2000;
+const TOF_SILENCE_DURATION_MS: u64 = 1000;
+const TOF_PULSE_DURATION_MS: u64 = 50;
+const TOF_NEUTRAL_ESC: i16 = 1500;
+const TOF_PULSE_ESC: i16 = 2000;
+const TOF_LISTEN_TIMEOUT_MS: u64 = 3000;
+const TOF_MIN_DETECT_MS: u64 = 50;        // Mínimo tiempo post-firing antes de detectar
+const TOF_CONFIRM_THRESHOLD: usize = 3;   // Muestras consecutivas para confirmar detección
+const TOF_BUFFER_SIZE: usize = 1000;
+
+// ============================================================================
+// ToF STATE COLORS
+// ============================================================================
+const C_IDLE: Color32 = Color32::from_rgb(0x94, 0xA3, 0xB8);
+const C_ARMING: Color32 = Color32::from_rgb(0xF9, 0x73, 0x16);
+const C_SILENCE: Color32 = Color32::from_rgb(0xFB, 0xBF, 0x24);
+const C_FIRING: Color32 = Color32::from_rgb(0xEF, 0x44, 0x44);
+const C_LISTENING: Color32 = Color32::from_rgb(0x10, 0xB9, 0x81);
+const C_DONE: Color32 = Color32::from_rgb(0x3B, 0x82, 0xF6);
 
 // ============================================================================
 // TIPOS
@@ -60,6 +83,69 @@ impl AcTarget {
             AcTarget::Slave => CMD_AC_SLAVE,
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Tab {
+    Control,
+    TofCalibration,
+}
+
+impl Tab {
+    fn label(&self) -> &'static str {
+        match self {
+            Tab::Control => "Control",
+            Tab::TofCalibration => "ToF Calibration",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum TofState {
+    Idle,
+    Arming,
+    Silence,
+    Firing,
+    Listening,
+    Done,
+}
+
+impl TofState {
+    fn label(&self) -> &'static str {
+        match self {
+            TofState::Idle => "Idle",
+            TofState::Arming => "Arming",
+            TofState::Silence => "Silence",
+            TofState::Firing => "Firing",
+            TofState::Listening => "Listening",
+            TofState::Done => "Done",
+        }
+    }
+
+    fn color(&self) -> Color32 {
+        match self {
+            TofState::Idle => C_IDLE,
+            TofState::Arming => C_ARMING,
+            TofState::Silence => C_SILENCE,
+            TofState::Firing => C_FIRING,
+            TofState::Listening => C_LISTENING,
+            TofState::Done => C_DONE,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TofResult {
+    timestamp: String,
+    target_hz: f64,
+    tof_ms: f64,
+    wavespeed: f64,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum TofShooter {
+    Master,
+    Slave,
 }
 
 // ============================================================================
@@ -117,6 +203,47 @@ pub struct SysIdApp {
 
     // --- Cierre diferido ---
     close_after: Option<Instant>,
+
+    // --- Tabs ---
+    active_tab: Tab,
+
+    // --- ToF Calibration ---
+    tof_state: TofState,
+    tof_target_hz: f64,
+    tof_entry_hz: String,
+    tof_threshold: f64,
+    tof_rope_length: f64,
+    tof_rope_entry: String,
+    tof_coeff_a: f64,
+    tof_coeff_b: f64,
+    tof_a_entry: String,
+    tof_b_entry: String,
+    tof_arm_time: Option<Instant>,
+    tof_armed: bool,
+    tof_t0_ms: Option<u32>,
+    tof_t1_ms: Option<u32>,
+    tof_tof_ms: f64,
+    tof_wavespeed: f64,
+    tof_wave_detected: bool,
+    tof_baseline: f64,
+    tof_baseline_samples: VecDeque<f64>,
+    tof_history: Vec<TofResult>,
+    tof_times: VecDeque<f64>,
+    tof_m_angle: VecDeque<f64>,
+    tof_s_angle: VecDeque<f64>,
+    tof_t0_line: Option<f64>,
+    tof_t1_line: Option<f64>,
+    tof_t1_sent: Option<Instant>,
+
+    tof_error_msg: Option<String>,
+
+    // --- ToF Shooter Selection ---
+    tof_shooter: TofShooter,
+    tof_confirm_count: usize,
+    tof_firing_time: Option<Instant>,
+
+    // --- AS5600 Diagnostic ---
+    diag_data: Option<DiagPacket>,
 }
 
 // ============================================================================
@@ -130,7 +257,7 @@ impl SysIdApp {
         visuals.window_fill = BG_MAIN;
         visuals.extreme_bg_color = BG_PANEL;
         visuals.widgets.noninteractive.bg_fill = BG_PANEL;
-        visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, FG_TEXT);
+        visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0f32, FG_TEXT);
         visuals.widgets.inactive.bg_fill = Color32::from_rgb(0xF1, 0xF5, 0xF9);
         visuals.widgets.hovered.bg_fill = Color32::from_rgb(0xE2, 0xE8, 0xF0);
         cc.egui_ctx.set_visuals(visuals);
@@ -184,6 +311,43 @@ impl SysIdApp {
             logo_loaded: false,
 
             close_after: None,
+
+            active_tab: Tab::Control,
+
+            tof_state: TofState::Idle,
+            tof_target_hz: 50.0,
+            tof_entry_hz: "50".to_string(),
+            tof_threshold: 10.0,
+            tof_rope_length: 1.0,
+            tof_rope_entry: "1.0".to_string(),
+            tof_coeff_a: 1.0,
+            tof_coeff_b: 0.0,
+            tof_a_entry: "1.0".to_string(),
+            tof_b_entry: "0.0".to_string(),
+            tof_arm_time: None,
+            tof_armed: false,
+            tof_t0_ms: None,
+            tof_t1_ms: None,
+            tof_tof_ms: 0.0,
+            tof_wavespeed: 0.0,
+            tof_wave_detected: false,
+            tof_baseline: 0.0,
+            tof_baseline_samples: VecDeque::new(),
+            tof_history: Vec::new(),
+            tof_times: VecDeque::with_capacity(TOF_BUFFER_SIZE),
+            tof_m_angle: VecDeque::with_capacity(TOF_BUFFER_SIZE),
+            tof_s_angle: VecDeque::with_capacity(TOF_BUFFER_SIZE),
+            tof_t0_line: None,
+            tof_t1_line: None,
+            tof_t1_sent: None,
+
+            tof_error_msg: None,
+
+            tof_shooter: TofShooter::Master,
+            tof_confirm_count: 0,
+            tof_firing_time: None,
+
+            diag_data: None,
         }
     }
 }
@@ -224,6 +388,69 @@ impl SysIdApp {
                     push_buf(&mut self.live_m_hz, pkt.m_hz);
                     push_buf(&mut self.live_s_hz, pkt.s_hz);
 
+                    // --- ToF Calibration buffers ---
+                    let tof_t = t_sec;
+                    push_buf_sized(&mut self.tof_times, tof_t, TOF_BUFFER_SIZE);
+                    push_buf_sized(
+                        &mut self.tof_m_angle,
+                        pkt.m_angle as f64,
+                        TOF_BUFFER_SIZE,
+                    );
+                    push_buf_sized(
+                        &mut self.tof_s_angle,
+                        pkt.s_angle as f64,
+                        TOF_BUFFER_SIZE,
+                    );
+
+                    // Feed baseline samples during Silence state
+                    if self.tof_state == TofState::Silence {
+                        let baseline_angle = match self.tof_shooter {
+                            TofShooter::Master => pkt.s_angle, // Master dispara → baseline del sensor Slave
+                            TofShooter::Slave => pkt.m_angle,  // Slave dispara → baseline del sensor Master
+                        };
+                        push_buf_sized(&mut self.tof_baseline_samples, baseline_angle as f64, 100);
+                    }
+
+                    // If listening, check for wave detection
+                    if self.tof_state == TofState::Listening && !self.tof_wave_detected {
+                        // Minimum time guard: skip detection for TOF_MIN_DETECT_MS after firing
+                        let past_min_time = self.tof_firing_time.map_or(true, |ft| {
+                            ft.elapsed() >= Duration::from_millis(TOF_MIN_DETECT_MS)
+                        });
+
+                        if past_min_time {
+                            let receiver_angle = match self.tof_shooter {
+                                TofShooter::Master => pkt.s_angle,  // Master dispara → detecta en Slave
+                                TofShooter::Slave => pkt.m_angle,   // Slave dispara → detecta en Master
+                            };
+                            let delta = (receiver_angle as f64 - self.tof_baseline).abs();
+                            if delta > self.tof_threshold {
+                                self.tof_confirm_count += 1;
+                                if self.tof_confirm_count >= TOF_CONFIRM_THRESHOLD {
+                                    self.tof_wave_detected = true;
+                                    self.tof_t1_ms = Some(pkt.timestamp_ms);
+                                    self.tof_tof_ms =
+                                        (pkt.timestamp_ms as i64 - self.tof_t0_ms.unwrap_or(0) as i64)
+                                            as f64;
+                                    self.tof_wavespeed =
+                                        self.tof_rope_length / (self.tof_tof_ms / 1000.0);
+                                    self.tof_t1_line = Some(tof_t);
+                                    self.tof_state = TofState::Done;
+
+                                    let ts = chrono::Local::now().format("%H:%M:%S").to_string();
+                                    self.tof_history.push(TofResult {
+                                        timestamp: ts,
+                                        target_hz: self.tof_target_hz,
+                                        tof_ms: self.tof_tof_ms,
+                                        wavespeed: self.tof_wavespeed,
+                                    });
+                                }
+                            } else {
+                                self.tof_confirm_count = 0; // Reset on miss
+                            }
+                        }
+                    }
+
                     // CSV
                     if self.is_recording {
                         self.data_log.push(pkt.clone());
@@ -233,6 +460,9 @@ impl SysIdApp {
                 }
                 SerialEvent::ParseError => {
                     self.pkt_errors += 1;
+                }
+                SerialEvent::Diagnostic(diag) => {
+                    self.diag_data = Some(diag);
                 }
                 SerialEvent::Disconnected => {
                     self.disconnect();
@@ -299,6 +529,7 @@ impl SysIdApp {
         self.ac_active = false;
         self.status_text = "DESCONECTADO".to_string();
         self.status_color = C_RED;
+        self.tof_state = TofState::Idle;
     }
 
     fn refresh_ports(&mut self) {
@@ -379,10 +610,17 @@ impl SysIdApp {
         self.ac_entry = "1500".to_string();
         self.status_text = "TODO DETENIDO".to_string();
         self.status_color = C_GREEN;
+        self.tof_state = TofState::Idle;
         if self.is_recording {
             self.stop_recording();
         }
-        self.close_after = Some(Instant::now() + std::time::Duration::from_millis(500));
+        self.close_after = Some(Instant::now() + Duration::from_millis(500));
+    }
+
+    fn request_encoder_diag(&mut self) {
+        if let Some(ref mut serial) = self.serial {
+            let _ = serial.send_command(CMD_ASK_ENCODER, 0);
+        }
     }
 
     fn sync_dc_from_entry(&mut self) {
@@ -396,6 +634,156 @@ impl SysIdApp {
         if let Ok(v) = self.ac_entry.parse::<i32>() {
             self.ac_value = v.clamp(1000, 2000);
             self.ac_entry = self.ac_value.to_string();
+        }
+    }
+}
+
+// ============================================================================
+// ToF CALIBRATION — STATE MACHINE
+// ============================================================================
+impl SysIdApp {
+    fn tof_update_state(&mut self) {
+        if self.serial.is_none() {
+            return;
+        }
+
+        let esc_spin_cmd = match self.tof_shooter {
+            TofShooter::Master => CMD_TOF_START,
+            TofShooter::Slave => CMD_TOF_FIRE_SLAVE,
+        };
+
+        match self.tof_state {
+            TofState::Idle => {}
+            TofState::Arming => {
+                if let Some(arm_time) = self.tof_arm_time {
+                    if arm_time.elapsed() >= Duration::from_millis(TOF_ARM_DURATION_MS) {
+                        let hz_val = self.tof_target_hz as i16;
+                        if let Some(ref mut serial) = self.serial {
+                            let _ = serial.send_command(esc_spin_cmd, hz_val);
+                        }
+                        self.tof_state = TofState::Silence;
+                        self.tof_arm_time = Some(Instant::now());
+                    }
+                }
+            }
+            TofState::Silence => {
+                if let Some(arm_time) = self.tof_arm_time {
+                    if arm_time.elapsed() >= Duration::from_millis(TOF_SILENCE_DURATION_MS) {
+                        let n = self.tof_baseline_samples.len();
+                        if n >= 5 {
+                            let sum: f64 = self.tof_baseline_samples.iter().rev().take(5).sum();
+                            self.tof_baseline = sum / 5.0;
+                        } else if n > 0 {
+                            let sum: f64 = self.tof_baseline_samples.iter().sum();
+                            self.tof_baseline = sum / n as f64;
+                        } else {
+                            self.tof_baseline = 0.0;
+                        }
+
+                        if let Some(ref mut serial) = self.serial {
+                            let _ = serial.send_command(esc_spin_cmd, TOF_PULSE_ESC);
+                        }
+                        self.tof_t0_ms = self.last_packet.as_ref().map(|p| p.timestamp_ms);
+                        self.tof_t0_line = self.tof_times.back().copied();
+                        self.tof_state = TofState::Firing;
+                        self.tof_arm_time = Some(Instant::now());
+                        self.tof_firing_time = Some(Instant::now());
+                        self.tof_confirm_count = 0;
+                    }
+                }
+            }
+            TofState::Firing => {
+                if let Some(arm_time) = self.tof_arm_time {
+                    if arm_time.elapsed() >= Duration::from_millis(TOF_PULSE_DURATION_MS) {
+                        if let Some(ref mut serial) = self.serial {
+                            let _ = serial.send_command(esc_spin_cmd, TOF_NEUTRAL_ESC);
+                        }
+                        self.tof_t1_sent = Some(Instant::now());
+                        self.tof_state = TofState::Listening;
+                    }
+                }
+            }
+            TofState::Listening => {
+                if let Some(t1_sent) = self.tof_t1_sent {
+                    if t1_sent.elapsed() >= Duration::from_millis(TOF_LISTEN_TIMEOUT_MS) {
+                        self.tof_tof_ms = 0.0;
+                        self.tof_wavespeed = 0.0;
+                        self.tof_error_msg = Some(
+                            "Error: Timeout. Cuerda no detectada o señal muy débil.".to_string()
+                        );
+                        self.tof_state = TofState::Done;
+                    }
+                }
+            }
+            TofState::Done => {}
+        }
+    }
+
+    fn tof_arm(&mut self) {
+        if self.tof_state != TofState::Idle || self.serial.is_none() {
+            return;
+        }
+        if let Some(ref mut serial) = self.serial {
+            let _ = serial.send_command(CMD_TOF_ARM, 0);
+        }
+        self.tof_arm_time = Some(Instant::now());
+        self.tof_armed = true;
+        self.tof_wave_detected = false;
+        self.tof_t0_ms = None;
+        self.tof_t1_ms = None;
+        self.tof_tof_ms = 0.0;
+        self.tof_wavespeed = 0.0;
+        self.tof_t0_line = None;
+        self.tof_t1_line = None;
+        self.tof_baseline_samples.clear();
+        self.tof_error_msg = None;
+        self.tof_state = TofState::Arming;
+    }
+
+    fn tof_stop(&mut self) {
+        if let Some(ref mut serial) = self.serial {
+            let _ = serial.send_command(CMD_TOF_STOP, 0);
+        }
+        self.tof_state = TofState::Idle;
+        self.tof_armed = false;
+        self.tof_arm_time = None;
+        self.tof_t1_sent = None;
+        self.tof_firing_time = None;
+        self.tof_confirm_count = 0;
+    }
+
+    fn tof_reset(&mut self) {
+        self.tof_state = TofState::Idle;
+        self.tof_armed = false;
+        self.tof_arm_time = None;
+        self.tof_t1_sent = None;
+        self.tof_firing_time = None;
+        self.tof_confirm_count = 0;
+        self.tof_wave_detected = false;
+        self.tof_t0_ms = None;
+        self.tof_t1_ms = None;
+        self.tof_tof_ms = 0.0;
+        self.tof_wavespeed = 0.0;
+        self.tof_t0_line = None;
+        self.tof_t1_line = None;
+        self.tof_error_msg = None;
+        self.tof_baseline_samples.clear();
+    }
+
+    fn tof_export_csv(&self) {
+        let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        let filename = format!("tof_results_{}.csv", ts);
+        if let Ok(mut writer) = csv::Writer::from_path(&filename) {
+            let _ = writer.write_record(["timestamp", "target_hz", "tof_ms", "wavespeed"]);
+            for r in &self.tof_history {
+                let _ = writer.write_record([
+                    &r.timestamp,
+                    &format!("{:.1}", r.target_hz),
+                    &format!("{:.2}", r.tof_ms),
+                    &format!("{:.4}", r.wavespeed),
+                ]);
+            }
+            let _ = writer.flush();
         }
     }
 }
@@ -549,6 +937,26 @@ impl SysIdApp {
                         .color(FG_DIM),
                 );
             });
+        });
+    }
+
+    fn render_tab_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.add_space(12.0);
+            for tab in [Tab::Control, Tab::TofCalibration] {
+                let is_active = self.active_tab == tab;
+                let text = RichText::new(tab.label())
+                    .size(13.0)
+                    .strong()
+                    .color(if is_active { Color32::WHITE } else { FG_DIM });
+                let btn = egui::Button::new(text)
+                    .fill(if is_active { C_BLUE } else { BG_PANEL })
+                    .rounding(Rounding::same(4.0))
+                    .min_size(egui::vec2(120.0, 28.0));
+                if ui.add(btn).clicked() {
+                    self.active_tab = tab;
+                }
+            }
         });
     }
 
@@ -800,6 +1208,40 @@ impl SysIdApp {
             );
         }
 
+        ui.add_space(8.0);
+
+        section(ui, "AS5600 DIAGNOSTIC", C_YELLOW, |ui| {
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(connected, colored_button_widget("🔍 DIAGNOSTICAR AS5600", C_YELLOW))
+                    .clicked()
+                {
+                    self.request_encoder_diag();
+                }
+            });
+
+            if let Some(ref d) = self.diag_data {
+                ui.add_space(4.0);
+                let mono = egui::FontId::monospace(10.0);
+                ui.label(RichText::new("── Master ──").size(11.0).strong().color(FG_TEXT));
+                ui.label(RichText::new(format!("  MPOS: {}  ZPOS: {}  MAG: {}", d.mpos_m, d.zpos_m, d.mag_m)).font(mono.clone()).color(FG_TEXT));
+                ui.label(RichText::new(format!("  AGC: {}   RAW: {}", d.agc_m, d.raw_m)).font(mono.clone()).color(FG_TEXT));
+                let m_conn_color = if d.conn_m == 1 { C_GREEN } else { C_RED };
+                let m_conn_txt = if d.conn_m == 1 { "YES" } else { "NO" };
+                ui.label(RichText::new(format!("  Connected: {}", m_conn_txt)).font(mono.clone()).color(m_conn_color));
+
+                ui.add_space(2.0);
+                ui.label(RichText::new("── Slave ──").size(11.0).strong().color(FG_TEXT));
+                ui.label(RichText::new(format!("  MPOS: {}  ZPOS: {}  MAG: {}", d.mpos_s, d.zpos_s, d.mag_s)).font(mono.clone()).color(FG_TEXT));
+                ui.label(RichText::new(format!("  AGC: {}   RAW: {}", d.agc_s, d.raw_s)).font(mono.clone()).color(FG_TEXT));
+                let s_conn_color = if d.conn_s == 1 { C_GREEN } else { C_RED };
+                let s_conn_txt = if d.conn_s == 1 { "YES" } else { "NO" };
+                ui.label(RichText::new(format!("  Connected: {}", s_conn_txt)).font(mono).color(s_conn_color));
+            } else {
+                ui.label(RichText::new("Sin datos. Presiona DIAGNOSTICAR.").size(10.0).color(FG_DIM));
+            }
+        });
+
         // ---- STATUS ----
         ui.add_space(10.0);
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
@@ -866,13 +1308,13 @@ impl SysIdApp {
                                 Line::new(PlotPoints::new(m_pwm))
                                     .color(C_BLUE)
                                     .name("M PWM")
-                                    .width(1.5),
+                                    .width(1.5f32),
                             );
                             plot_ui.line(
                                 Line::new(PlotPoints::new(s_pwm))
                                     .color(C_GREEN)
                                     .name("S PWM")
-                                    .width(1.5),
+                                    .width(1.5f32),
                             );
                         }
                         plot_ui.set_plot_bounds(PlotBounds::from_min_max(
@@ -917,13 +1359,13 @@ impl SysIdApp {
                                 Line::new(PlotPoints::new(m_esc))
                                     .color(C_ORANGE)
                                     .name("M ESC")
-                                    .width(1.5),
+                                    .width(1.5f32),
                             );
                             plot_ui.line(
                                 Line::new(PlotPoints::new(s_esc))
                                     .color(C_YELLOW)
                                     .name("S ESC")
-                                    .width(1.5),
+                                    .width(1.5f32),
                             );
                         }
                         plot_ui.set_plot_bounds(PlotBounds::from_min_max(
@@ -973,13 +1415,13 @@ impl SysIdApp {
                                 Line::new(PlotPoints::new(m_rpm))
                                     .color(C_BLUE)
                                     .name("M RPM")
-                                    .width(1.5),
+                                    .width(1.5f32),
                             );
                             plot_ui.line(
                                 Line::new(PlotPoints::new(s_rpm))
                                     .color(C_GREEN)
                                     .name("S RPM")
-                                    .width(1.5),
+                                    .width(1.5f32),
                             );
                         }
                         plot_ui.set_plot_bounds(PlotBounds::from_min_max(
@@ -1024,13 +1466,13 @@ impl SysIdApp {
                                 Line::new(PlotPoints::new(m_hz))
                                     .color(C_ORANGE)
                                     .name("M Hz")
-                                    .width(1.5),
+                                    .width(1.5f32),
                             );
                             plot_ui.line(
                                 Line::new(PlotPoints::new(s_hz))
                                     .color(C_YELLOW)
                                     .name("S Hz")
-                                    .width(1.5),
+                                    .width(1.5f32),
                             );
                         }
                         plot_ui.set_plot_bounds(PlotBounds::from_min_max(
@@ -1039,6 +1481,552 @@ impl SysIdApp {
                         ));
                     });
             });
+        });
+    }
+}
+
+// ============================================================================
+// ToF CALIBRATION — RENDERING
+// ============================================================================
+impl SysIdApp {
+    fn render_tof_tab(&mut self, ui: &mut egui::Ui) {
+        let available = ui.available_size();
+        let card_w = (available.x - 30.0) / 2.0;
+        let card_h = (available.y - 10.0) / 2.0;
+
+        ui.horizontal(|ui| {
+            ui.add_space(5.0);
+            ui.vertical(|ui| {
+                // Row 1: Control + Detection
+                ui.horizontal(|ui| {
+                    ui.allocate_ui(egui::vec2(card_w, card_h), |ui| {
+                        self.render_tof_control_card(ui);
+                    });
+                    ui.add_space(10.0);
+                    ui.allocate_ui(egui::vec2(card_w, card_h), |ui| {
+                        self.render_tof_detection_card(ui);
+                    });
+                });
+
+                ui.add_space(8.0);
+
+                // Row 2: Results + Transfer Function
+                ui.horizontal(|ui| {
+                    ui.allocate_ui(egui::vec2(card_w, card_h), |ui| {
+                        self.render_tof_results_card(ui);
+                    });
+                    ui.add_space(10.0);
+                    ui.allocate_ui(egui::vec2(card_w, card_h), |ui| {
+                        self.render_tof_transfer_card(ui);
+                    });
+                });
+            });
+        });
+    }
+
+    fn render_tof_control_card(&mut self, ui: &mut egui::Ui) {
+        let connected = self.serial.is_some();
+        section(ui, "ToF — CONTROL", self.tof_state.color(), |ui| {
+            // State indicator badge
+            let state_color = self.tof_state.color();
+            let state_label = self.tof_state.label();
+            ui.horizontal(|ui| {
+                ui.add_space(4.0);
+                egui::Frame::none()
+                    .fill(state_color)
+                    .rounding(Rounding::same(6.0))
+                    .inner_margin(egui::Margin::symmetric(16.0, 6.0))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(state_label)
+                                .strong()
+                                .size(14.0)
+                                .color(Color32::WHITE),
+                        );
+                    });
+            });
+
+            ui.add_space(8.0);
+
+            let can_change_shooter = self.tof_state == TofState::Idle;
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Disparador:").size(10.0).color(FG_DIM));
+                ui.add_enabled_ui(can_change_shooter, |ui| {
+                    if ui
+                        .selectable_label(self.tof_shooter == TofShooter::Master, "Master")
+                        .clicked()
+                    {
+                        self.tof_shooter = TofShooter::Master;
+                    }
+                    if ui
+                        .selectable_label(self.tof_shooter == TofShooter::Slave, "Slave")
+                        .clicked()
+                    {
+                        self.tof_shooter = TofShooter::Slave;
+                    }
+                });
+            });
+
+            ui.add_space(6.0);
+
+            // Buttons
+            ui.horizontal(|ui| {
+                let can_arm =
+                    connected && self.tof_state == TofState::Idle;
+                let can_stop = connected
+                    && self.tof_state != TofState::Idle
+                    && self.tof_state != TofState::Done;
+                let can_start =
+                    connected && self.tof_state == TofState::Done;
+
+                if ui
+                    .add_enabled(can_arm, colored_button_widget("ARM", C_ARMING))
+                    .clicked()
+                {
+                    self.tof_arm();
+                }
+                ui.add_space(4.0);
+                if ui
+                    .add_enabled(can_stop, colored_button_widget("STOP", C_RED))
+                    .clicked()
+                {
+                    self.tof_stop();
+                }
+                ui.add_space(4.0);
+                if ui
+                    .add_enabled(
+                        can_start,
+                        colored_button_widget("▶ START", C_GREEN),
+                    )
+                    .clicked()
+                {
+                    self.tof_reset();
+                    self.tof_arm();
+                }
+            });
+
+            ui.add_space(6.0);
+
+            // Status description
+            if let Some(ref err) = self.tof_error_msg {
+                ui.label(
+                    RichText::new(err)
+                        .size(11.0)
+                        .strong()
+                        .color(C_RED),
+                );
+            } else {
+                let status_msg = match self.tof_state {
+                    TofState::Idle => "Ready. Click ARM to begin.",
+                    TofState::Arming => "Ramping ESC to target Hz...",
+                    TofState::Silence => "Waiting for steady state...",
+                    TofState::Firing => "Sniper pulse active (50ms)!",
+                    TofState::Listening => "Listening for wave arrival...",
+                    TofState::Done => {
+                        if self.tof_wave_detected {
+                            "Experiment complete. Wave detected!"
+                        } else {
+                            "Experiment complete."
+                        }
+                    }
+                };
+                ui.label(
+                    RichText::new(status_msg)
+                        .size(10.0)
+                        .color(FG_DIM),
+                );
+            }
+        });
+    }
+
+    fn render_tof_detection_card(&mut self, ui: &mut egui::Ui) {
+        section(ui, "ToF — DETECCIÓN", C_CYAN, |ui| {
+            // Threshold slider
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Umbral delta:")
+                        .size(10.0)
+                        .color(FG_DIM),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.tof_threshold, 1.0..=100.0)
+                        .show_value(true)
+                        .trailing_fill(true),
+                );
+            });
+
+            ui.add_space(4.0);
+
+            // Heartbeat info
+            let mono = egui::FontId::monospace(10.0);
+            if let Some(t0) = self.tof_t0_ms {
+                ui.label(
+                    RichText::new(format!("T0: {}ms", t0))
+                        .font(mono.clone())
+                        .color(C_FIRING),
+                );
+            }
+            if let Some(t1) = self.tof_t1_ms {
+                ui.label(
+                    RichText::new(format!("T1: {}ms", t1))
+                        .font(mono.clone())
+                        .color(C_LISTENING),
+                );
+            }
+            if self.tof_tof_ms > 0.0 {
+                ui.label(
+                    RichText::new(format!("ToF: {:.2} ms", self.tof_tof_ms))
+                        .font(mono.clone())
+                        .color(C_BLUE)
+                        .strong(),
+                );
+            }
+
+            ui.add_space(4.0);
+
+            // Live plot
+            let plot_h = ui.available_height().max(80.0);
+            let m_angle: Vec<[f64; 2]> = self
+                .tof_times
+                .iter()
+                .zip(self.tof_m_angle.iter())
+                .map(|(&t, &v)| [t, v])
+                .collect();
+            let s_angle: Vec<[f64; 2]> = self
+                .tof_times
+                .iter()
+                .zip(self.tof_s_angle.iter())
+                .map(|(&t, &v)| [t, v])
+                .collect();
+
+            ui.allocate_ui(egui::vec2(ui.available_width(), plot_h), |ui| {
+                Plot::new("tof_angle_plot")
+                    .legend(Legend::default())
+                    .x_axis_label("Tiempo (s)")
+                    .y_axis_label("Angle")
+                    .allow_zoom(false)
+                    .allow_scroll(false)
+                    .allow_drag(false)
+                    .allow_boxed_zoom(false)
+                    .show(ui, |plot_ui| {
+                        // Compute bounds first (before moving data into PlotPoints)
+                        let (bounds_t_min, bounds_t_max, bounds_a_min, bounds_a_max) =
+                            if !m_angle.is_empty() {
+                                let t_min = self.tof_times.front().copied().unwrap_or(0.0);
+                                let t_max = self.tof_times.back().copied().unwrap_or(t_min + 1.0);
+                                let a_min = m_angle
+                                    .iter()
+                                    .chain(s_angle.iter())
+                                    .map(|p| p[1])
+                                    .fold(f64::INFINITY, f64::min);
+                                let a_max = m_angle
+                                    .iter()
+                                    .chain(s_angle.iter())
+                                    .map(|p| p[1])
+                                    .fold(f64::NEG_INFINITY, f64::max);
+                                let margin = (a_max - a_min).abs().max(10.0) * 0.2;
+                                let a_min = if a_min.is_infinite() { -100.0 } else { a_min - margin };
+                                let a_max = if a_max.is_infinite() { 100.0 } else { a_max + margin };
+                                (t_min, f64::max(t_max, t_min + 1.0), a_min, a_max)
+                            } else {
+                                (0.0, 1.0, -100.0, 100.0)
+                            };
+
+                        if !m_angle.is_empty() {
+                            plot_ui.line(
+                                Line::new(PlotPoints::new(m_angle))
+                                    .color(C_BLUE)
+                                    .name("m_angle")
+                                    .width(1.5f32),
+                            );
+                            plot_ui.line(
+                                Line::new(PlotPoints::new(s_angle))
+                                    .color(C_GREEN)
+                                    .name("s_angle")
+                                    .width(1.5f32),
+                            );
+                        }
+                        // T0 marker
+                        if let Some(t0) = self.tof_t0_line {
+                            plot_ui.vline(
+                                VLine::new(t0)
+                                    .color(C_FIRING)
+                                    .width(2.0f32)
+                                    .style(LineStyle::dashed_loose())
+                                    .name("T0"),
+                            );
+                        }
+                        // T1 marker
+                        if let Some(t1) = self.tof_t1_line {
+                            plot_ui.vline(
+                                VLine::new(t1)
+                                    .color(C_LISTENING)
+                                    .width(2.0f32)
+                                    .style(LineStyle::dashed_loose())
+                                    .name("T1"),
+                            );
+                        }
+                        // Set bounds
+                        plot_ui.set_plot_bounds(PlotBounds::from_min_max(
+                            [bounds_t_min, bounds_a_min],
+                            [bounds_t_max, bounds_a_max],
+                        ));
+                    });
+            });
+        });
+    }
+
+    fn render_tof_results_card(&mut self, ui: &mut egui::Ui) {
+        section(ui, "ToF — RESULTADOS", C_GREEN, |ui| {
+            // Rope length input
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Largo cuerda:")
+                        .size(10.0)
+                        .color(FG_DIM),
+                );
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.tof_rope_entry)
+                        .desired_width(60.0)
+                        .font(egui::FontId::proportional(13.0))
+                        .horizontal_align(egui::Align::Center),
+                );
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    if let Ok(v) = self.tof_rope_entry.parse::<f64>() {
+                        self.tof_rope_length = v.clamp(0.5, 5.0);
+                        self.tof_rope_entry = format!("{:.2}", self.tof_rope_length);
+                    }
+                }
+                ui.label(RichText::new("m (0.5-5.0)").size(9.0).color(FG_DIM));
+            });
+            ui.add(
+                egui::Slider::new(&mut self.tof_rope_length, 0.5..=5.0)
+                    .show_value(true)
+                    .trailing_fill(true),
+            );
+            if ui.input(|i| i.pointer.any_released()) {
+                self.tof_rope_entry = format!("{:.2}", self.tof_rope_length);
+            }
+
+            ui.add_space(6.0);
+
+            // Results
+            let mono = egui::FontId::monospace(11.0);
+            ui.label(
+                RichText::new(format!("ToF:       {:.2} ms", self.tof_tof_ms))
+                    .font(mono.clone())
+                    .color(FG_TEXT),
+            );
+            ui.label(
+                RichText::new(format!("Wavespeed: {:.4} m/s", self.tof_wavespeed))
+                    .font(mono.clone())
+                    .color(C_GREEN)
+                    .strong(),
+            );
+
+            ui.add_space(6.0);
+
+            // Export button
+            if !self.tof_history.is_empty() {
+                if ui
+                    .add(colored_button_widget("Exportar CSV", C_GREEN))
+                    .clicked()
+                {
+                    self.tof_export_csv();
+                }
+            }
+
+            ui.add_space(6.0);
+
+            ui.label(
+                RichText::new("Historial:")
+                    .strong()
+                    .size(10.0)
+                    .color(FG_DIM),
+            );
+            let table_mono = egui::FontId::monospace(9.0);
+            let start = if self.tof_history.len() > 10 {
+                self.tof_history.len() - 10
+            } else {
+                0
+            };
+            let visible: Vec<_> = self.tof_history[start..].to_vec();
+            egui::ScrollArea::horizontal()
+                .max_width(ui.available_width())
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Hora").font(table_mono.clone()).color(FG_DIM));
+                        ui.label(RichText::new("Hz").font(table_mono.clone()).color(FG_DIM));
+                        ui.label(RichText::new("ToF").font(table_mono.clone()).color(FG_DIM));
+                        ui.label(RichText::new("V.m/s").font(table_mono.clone()).color(FG_DIM));
+                    });
+                    for r in &visible {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(&r.timestamp).font(table_mono.clone()).color(FG_TEXT),
+                            );
+                            ui.label(
+                                RichText::new(format!("{:.0}", r.target_hz))
+                                    .font(table_mono.clone())
+                                    .color(FG_TEXT),
+                            );
+                            ui.label(
+                                RichText::new(format!("{:.1}", r.tof_ms))
+                                    .font(table_mono.clone())
+                                    .color(FG_TEXT),
+                            );
+                            ui.label(
+                                RichText::new(format!("{:.2}", r.wavespeed))
+                                    .font(table_mono.clone())
+                                    .color(FG_TEXT),
+                            );
+                        });
+                    }
+                });
+        });
+    }
+
+    fn render_tof_transfer_card(&mut self, ui: &mut egui::Ui) {
+        section(ui, "ToF — FUNCIÓN DE TRANSFERENCIA", C_ORANGE, |ui| {
+            let mono = egui::FontId::monospace(12.0);
+
+            // Coefficient A
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("A:")
+                        .size(10.0)
+                        .color(FG_DIM),
+                );
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.tof_a_entry)
+                        .desired_width(80.0)
+                        .font(egui::FontId::proportional(14.0))
+                        .horizontal_align(egui::Align::Center),
+                );
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    if let Ok(v) = self.tof_a_entry.parse::<f64>() {
+                        self.tof_coeff_a = v;
+                        self.tof_a_entry = format!("{:.4}", self.tof_coeff_a);
+                    }
+                }
+            });
+
+            ui.add_space(4.0);
+
+            // Coefficient B
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("B:")
+                        .size(10.0)
+                        .color(FG_DIM),
+                );
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.tof_b_entry)
+                        .desired_width(80.0)
+                        .font(egui::FontId::proportional(14.0))
+                        .horizontal_align(egui::Align::Center),
+                );
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    if let Ok(v) = self.tof_b_entry.parse::<f64>() {
+                        self.tof_coeff_b = v;
+                        self.tof_b_entry = format!("{:.4}", self.tof_coeff_b);
+                    }
+                }
+            });
+
+            ui.add_space(8.0);
+
+            ui.label(
+                RichText::new("Target Hz")
+                    .size(10.0)
+                    .color(FG_DIM),
+            );
+            ui.horizontal(|ui| {
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.tof_entry_hz)
+                        .desired_width(80.0)
+                        .font(egui::FontId::proportional(14.0))
+                        .horizontal_align(egui::Align::Center),
+                );
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    if let Ok(v) = self.tof_entry_hz.parse::<f64>() {
+                        self.tof_target_hz = v.clamp(1.0, 100.0);
+                        self.tof_entry_hz = format!("{:.0}", self.tof_target_hz);
+                    }
+                }
+                ui.label(
+                    RichText::new("Hz (1-100)")
+                        .size(9.0)
+                        .color(FG_DIM),
+                );
+            });
+            ui.add(
+                egui::Slider::new(&mut self.tof_target_hz, 1.0..=100.0)
+                    .show_value(true)
+                    .trailing_fill(true),
+            );
+            if ui.input(|i| i.pointer.any_released()) {
+                self.tof_entry_hz = format!("{:.0}", self.tof_target_hz);
+            }
+
+            ui.add_space(4.0);
+
+            let f1 = self.tof_target_hz;
+            ui.label(
+                RichText::new(format!("f1: {:.1} Hz", f1))
+                    .font(mono.clone())
+                    .color(FG_TEXT),
+            );
+
+            ui.add_space(4.0);
+
+            // µs output
+            let us_output = if self.tof_coeff_a != 0.0 {
+                (f1 - self.tof_coeff_b) / self.tof_coeff_a
+            } else {
+                0.0
+            };
+            ui.label(
+                RichText::new(format!("µs output: {:.1}", us_output))
+                    .font(mono.clone())
+                    .color(C_ORANGE)
+                    .strong(),
+            );
+
+            ui.add_space(6.0);
+
+            // Formula display
+            ui.label(
+                RichText::new(format!(
+                    "µs = (f1 - B) / A = ({:.1} - {:.2}) / {:.4}",
+                    f1, self.tof_coeff_b, self.tof_coeff_a
+                ))
+                .size(9.0)
+                .color(FG_DIM),
+            );
+
+            ui.add_space(8.0);
+
+            // Send to ESC button
+            let connected = self.serial.is_some();
+            let us_val = us_output.round() as i16;
+            if ui
+                .add_enabled(
+                    connected,
+                    colored_button_widget(
+                        &format!("Enviar {}µs a ESC", us_val),
+                        C_ORANGE,
+                    ),
+                )
+                .clicked()
+            {
+                if let Some(ref mut serial) = self.serial {
+                    let _ = serial.send_command(CMD_TOF_START, us_val.clamp(1000, 2000));
+                }
+                self.status_text = format!("TOF: Enviado {}µs a ESC", us_val);
+                self.status_color = C_ORANGE;
+            }
         });
     }
 }
@@ -1056,6 +2044,9 @@ impl eframe::App for SysIdApp {
         // Procesar datos serial entrantes
         self.poll_serial();
         self.check_watchdog();
+
+        // ToF state machine
+        self.tof_update_state();
 
         // Cierre diferido (stop_all -> cerrar en 500ms)
         if let Some(t) = self.close_after {
@@ -1081,40 +2072,70 @@ impl eframe::App for SysIdApp {
                 egui::Frame::none()
                     .fill(BG_MAIN)
                     .inner_margin(egui::Margin::symmetric(15.0, 10.0))
-                    .stroke(Stroke::new(1.0, C_BORDER)),
+                    .stroke(Stroke::new(1.0f32, C_BORDER)),
             )
             .exact_height(70.0)
             .show(ctx, |ui| {
                 self.render_header(ui);
             });
 
-        // ---- PANEL IZQUIERDO ----
-        egui::SidePanel::left("controls")
-            .exact_width(SIDE_PANEL_WIDTH)
+        // ---- TAB BAR ----
+        egui::TopBottomPanel::top("tab_bar")
             .frame(
                 egui::Frame::none()
                     .fill(BG_MAIN)
-                    .inner_margin(egui::Margin::symmetric(12.0, 10.0))
-                    .stroke(Stroke::new(1.0, C_BORDER)),
+                    .inner_margin(egui::Margin::symmetric(5.0, 4.0))
+                    .stroke(Stroke::new(1.0f32, C_BORDER)),
             )
+            .exact_height(36.0)
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false; 2])
-                    .show(ui, |ui| {
-                        self.render_controls(ui);
-                    });
+                self.render_tab_bar(ui);
             });
 
-        // ---- PANEL CENTRAL (GRÁFICOS) ----
-        egui::CentralPanel::default()
-            .frame(
-                egui::Frame::none()
-                    .fill(BG_MAIN)
-                    .inner_margin(egui::Margin::symmetric(10.0, 5.0)),
-            )
-            .show(ctx, |ui| {
-                self.render_plots(ui);
-            });
+        // ---- CONTENT BASED ON TAB ----
+        match self.active_tab {
+            Tab::Control => {
+                // ---- PANEL IZQUIERDO ----
+                egui::SidePanel::left("controls")
+                    .exact_width(SIDE_PANEL_WIDTH)
+                    .frame(
+                        egui::Frame::none()
+                            .fill(BG_MAIN)
+                            .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+                            .stroke(Stroke::new(1.0f32, C_BORDER)),
+                    )
+                    .show(ctx, |ui| {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false; 2])
+                            .show(ui, |ui| {
+                                self.render_controls(ui);
+                            });
+                    });
+
+                // ---- PANEL CENTRAL (GRÁFICOS) ----
+                egui::CentralPanel::default()
+                    .frame(
+                        egui::Frame::none()
+                            .fill(BG_MAIN)
+                            .inner_margin(egui::Margin::symmetric(10.0, 5.0)),
+                    )
+                    .show(ctx, |ui| {
+                        self.render_plots(ui);
+                    });
+            }
+            Tab::TofCalibration => {
+                // ---- ToF CALIBRATION: Full-width panel ----
+                egui::CentralPanel::default()
+                    .frame(
+                        egui::Frame::none()
+                            .fill(BG_MAIN)
+                            .inner_margin(egui::Margin::symmetric(5.0, 5.0)),
+                    )
+                    .show(ctx, |ui| {
+                        self.render_tof_tab(ui);
+                    });
+            }
+        }
 
         // ---- MODAL DE MENSAJE ----
         let mut close_msg = false;
@@ -1127,7 +2148,7 @@ impl eframe::App for SysIdApp {
                     egui::Frame::window(&ctx.style())
                         .fill(BG_MAIN)
                         .rounding(Rounding::same(8.0))
-                        .stroke(Stroke::new(1.0, C_BORDER)),
+                        .stroke(Stroke::new(1.0f32, C_BORDER)),
                 )
                 .show(ctx, |ui| {
                     ui.add_space(5.0);
@@ -1155,11 +2176,18 @@ fn push_buf(buf: &mut VecDeque<f64>, val: f64) {
     buf.push_back(val);
 }
 
+fn push_buf_sized(buf: &mut VecDeque<f64>, val: f64, max_size: usize) {
+    if buf.len() >= max_size {
+        buf.pop_front();
+    }
+    buf.push_back(val);
+}
+
 /// Sección estilizada (similar a LabelFrame de Tkinter)
 fn section(ui: &mut egui::Ui, title: &str, color: Color32, add_body: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::none()
         .fill(BG_PANEL)
-        .stroke(Stroke::new(1.0, C_BORDER))
+        .stroke(Stroke::new(1.0f32, C_BORDER))
         .rounding(Rounding::same(6.0))
         .inner_margin(egui::Margin::same(12.0))
         .show(ui, |ui| {

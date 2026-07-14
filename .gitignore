@@ -4,3 +4,7 @@
 .vscode/launch.json
 .vscode/ipch
 rust_hmi/target/
+
+# MemPalace per-project files (issue #185)
+mempalace.yaml
+entities.json

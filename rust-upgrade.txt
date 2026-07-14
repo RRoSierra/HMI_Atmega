@@ -1,0 +1,109 @@
+Documentación de Característica: Módulo de Calibración ToF (Rust HMI)
+
+Resumen
+
+Esta característica introduce una nueva pestaña en el Dashboard de Identificación de Sistemas (escrito en Rust con egui). Su objetivo es orquestar un experimento de Tiempo de Vuelo (ToF - Time of Flight) en la cuerda de limpieza del robot, midiendo la latencia ($\Delta t$) de propagación mecánica entre el Master y el Slave para calcular empíricamente la frecuencia de resonancia base ($f_1$).
+
+Arquitectura de la Interfaz (UI)
+
+Para mantener la limpieza visual, el HMI se divide mediante un sistema de Pestañas (Tabs):
+
+Global (Siempre visible): Panel lateral izquierdo con selección de puerto serial, botón de conexión y estadísticas de paquetes/errores.
+
+Tab 1: DAQ y Lazo Abierto: Interfaz clásica de monitoreo de 4 gráficos e inyección manual.
+
+Tab 2: Calibración ToF (NUEVO): Interfaz dedicada exclusivamente al experimento de resonancia.
+
+El panel de Calibración ToF se divide en 4 "Tarjetas" (Cards) principales:
+
+1. Configuración del Experimento
+
+Permite al ingeniero ajustar las variables físicas antes del disparo:
+
+Longitud de Cuerda ($L$): (m) Dato informativo para el cálculo de la velocidad de propagación de la onda ($v = L / \Delta t$).
+
+Umbral de Detección: (ticks) Sensibilidad del encoder magnético AS5600 para discriminar la onda del ruido ambiente.
+
+Selector de Método: (Dropdown) Permite elegir entre las dos estrategias de excitación mecánicas (ver sección Modos de Excitación).
+
+2. Control de Secuencia
+
+Contiene el botón "INICIAR SECUENCIA" y badges de estado. Al finalizar, muestra en grande los resultados calculados:
+
+Tiempo de Vuelo ($\Delta t$): En milisegundos.
+
+Frecuencia Base ($f_1$): Calculada como $f_1 = \frac{1}{2 \Delta t}$ (en Hz).
+
+3. Registro de Impacto (Dual Plot)
+
+Un gráfico único que visualiza la telemetría del encoder AS5600 de ambos nodos simultáneamente durante la ventana de tiempo del experimento:
+
+Línea Azul: $\Delta$ Ángulo Master (T0).
+
+Línea Naranja: $\Delta$ Ángulo Slave (T1).
+
+4. Función de Transferencia
+
+Permite caracterizar las diferencias de fabricación de los ESC comerciales chinos.
+
+Fórmula: $Hz = A \cdot \mu s + B \implies \mu s = \frac{Hz - B}{A}$
+
+Entradas para constantes $A$ y $B$.
+
+Botón [ TEST f1 ]: Aplica la función inversa al valor $f_1$ obtenido empíricamente y envía el ancho de pulso resultante (en $\mu s$) al robot para verificar visualmente si entra en resonancia perfecta.
+
+Modos de Excitación (Disparo)
+
+Dado el comportamiento de seguridad de los ESC comerciales (que emiten pitidos de "Heartbeat" usando las bobinas del motor al encenderse), se diseñaron dos enfoques seleccionables desde la UI:
+
+A. Método Sniper (Latigazo Limpio)
+
+Objetivo: Inyectar un pulso mecánico puro similar a una función Delta de Dirac.
+
+Secuencia:
+
+Armado: Se enciende el relé y se aplica PWM neutro (1500µs).
+
+Asentamiento: Se esperan 1.5 a 2.0 segundos de absoluto silencio para que la tensión de la cuerda elimine las vibraciones del Heartbeat inicial.
+
+Disparo: El Master inyecta un pulso máximo (2000µs) durante 50ms y vuelve a neutro.
+
+Ventaja: Genera un pico altísimo y fácil de detectar en los gráficos.
+
+B. Método Heartbeat (Encendido)
+
+Objetivo: Aprovechar el ruido inevitable de la secuencia de inicialización del ESC.
+
+Secuencia:
+
+Disparo: Se marca T0 en el instante exacto en que se enciende el relé de poder del ESC.
+
+Escucha: El Master y el Slave registran el tren de pulsos y armónicos generados por la melodía de arranque del ESC.
+
+Ventaja: No requiere programar perfiles de aceleración especiales; evalúa el robot en condiciones estándar de encendido.
+
+Máquina de Estados del HMI (Software PC)
+
+La orquestación del experimento reside en el PC (Rust), no en los microcontroladores. El ATmega328P funciona como un "títere" ciego enviando telemetría de alta velocidad.
+
+El hilo de la UI de Rust ejecutará la siguiente lógica no bloqueante al presionar "Iniciar":
+
+Lock UI: Deshabilita botones para evitar comandos cruzados.
+
+Envía comando UART para Armar ESCs.
+
+Inicia temporizador interno (std::time::Instant).
+
+Fase Silencio: Muestra "Cargando..." e ignora fluctuaciones.
+
+Fase Disparo: Envía comando UART de inyección (si es modo Sniper). Registra T0 al ver el salto en la variable mHz o mAngle.
+
+Fase Escucha: Monitorea la variable sHz o sAngle entrante en el buffer serial.
+
+Al superar el Umbral definido, registra T1.
+
+Detiene inyección y motores.
+
+Cálculo: $\Delta t = T1 - T0$. Actualiza Labels en UI.
+
+Unlock UI: Habilita botones.

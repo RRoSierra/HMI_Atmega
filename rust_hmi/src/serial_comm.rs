@@ -8,11 +8,11 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::protocol::{self, TelemetryPacket, PKT_SIZE, PKT_START};
+use crate::protocol::{self, DiagPacket, TelemetryPacket, DIAG_START, PKT_SIZE, PKT_START};
 
-/// Eventos enviados desde el hilo serial hacia la UI
 pub enum SerialEvent {
     Packet(TelemetryPacket),
+    Diagnostic(DiagPacket),
     ParseError,
     Disconnected,
 }
@@ -59,12 +59,9 @@ impl SerialConnection {
                 Ok(n) if n > 0 => {
                     buf.extend_from_slice(&read_buf[..n]);
 
-                    // Procesar todos los paquetes completos en el buffer
                     while buf.len() >= PKT_SIZE {
-                        // Buscar byte de inicio 0xAA
-                        if let Some(idx) = buf.iter().position(|&b| b == PKT_START) {
+                        if let Some(idx) = buf.iter().position(|&b| b == PKT_START || b == DIAG_START) {
                             if idx > 0 {
-                                // Descartar bytes basura antes del 0xAA
                                 for _ in 0..idx {
                                     let _ = tx.send(SerialEvent::ParseError);
                                 }
@@ -74,19 +71,29 @@ impl SerialConnection {
                                 break;
                             }
 
-                            // Extraer 22 bytes candidatos
                             let frame: [u8; PKT_SIZE] =
                                 buf[..PKT_SIZE].try_into().unwrap();
 
-                            if let Some(pkt) = TelemetryPacket::parse(&frame) {
-                                buf.drain(..PKT_SIZE);
-                                if tx.send(SerialEvent::Packet(pkt)).is_err() {
-                                    return;
+                            if frame[0] == PKT_START {
+                                if let Some(pkt) = TelemetryPacket::parse(&frame) {
+                                    buf.drain(..PKT_SIZE);
+                                    if tx.send(SerialEvent::Packet(pkt)).is_err() {
+                                        return;
+                                    }
+                                } else {
+                                    let _ = tx.send(SerialEvent::ParseError);
+                                    buf.drain(..1);
                                 }
-                            } else {
-                                // Checksum falló: descartar el 0xAA y buscar siguiente
-                                let _ = tx.send(SerialEvent::ParseError);
-                                buf.drain(..1);
+                            } else if frame[0] == DIAG_START {
+                                if let Some(pkt) = DiagPacket::parse(&frame) {
+                                    buf.drain(..PKT_SIZE);
+                                    if tx.send(SerialEvent::Diagnostic(pkt)).is_err() {
+                                        return;
+                                    }
+                                } else {
+                                    let _ = tx.send(SerialEvent::ParseError);
+                                    buf.drain(..1);
+                                }
                             }
                         } else {
                             buf.clear();
