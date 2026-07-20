@@ -24,6 +24,8 @@ pub const CMD_TOF_START: u8 = 0x78;
 pub const CMD_TOF_STOP: u8 = 0x79;
 pub const CMD_TOF_FIRE_SLAVE: u8 = 0x7A;  // Enviar pulso ESC al Slave (ToF reverso)
 pub const CMD_ASK_ENCODER: u8 = 0x7B;     // Diagnóstico AS5600 on-demand
+pub const CMD_TOF_DETACH: u8 = 0x7C;      // Detach ESC receptor (val=0:local, 1:remoto)
+pub const CMD_TOF_ATTACH: u8 = 0x7D;      // Attach ESC receptor  (val=0:local, 1:remoto)
 
 #[derive(Debug, Clone)]
 pub struct TelemetryPacket {

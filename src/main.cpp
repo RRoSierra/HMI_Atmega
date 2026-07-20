@@ -77,7 +77,9 @@
 #define SPI_CMD_TOF_START   0x78
 #define SPI_CMD_TOF_STOP    0x79
 #define SPI_CMD_TOF_FIRE_SLAVE 0x7A  // Enviar pulso ESC al Slave (ToF reverso)
-#define SPI_CMD_ASK_ENCODER 0x7B  // Solicitar diagnóstico AS5600 on-demand
+#define SPI_CMD_TOF_DETACH   0x7C  // Detach ESC receptor (val=0: local, val=1: Slave via UART)
+#define SPI_CMD_TOF_ATTACH   0x7D  // Attach ESC receptor  (val=0: local, val=1: Slave via UART)
+#define SPI_CMD_ASK_ENCODER  0x7B  // Solicitar diagnóstico AS5600 on-demand
 
 // ============================================================================
 // PROTOCOLO UART: MASTER ↔ SLAVE
@@ -89,6 +91,8 @@
 #define UART_RSP_TELEM      0x7E  // + 12 bytes LE (RPM, Hz100, PWM, ESC, mAngle, sAngle)
 #define UART_CMD_ASK_ENCODER 0x7F  // sin payload → Slave responde 12 bytes diag AS5600
 #define UART_RSP_DIAG       0x80  // + 12 bytes diag (MPOS, ZPOS, MAG, CONF, AGC, RAW, CONN)
+#define UART_CMD_DETACH     0x81  // sin payload → Slave detach ESC (stop PWM)
+#define UART_CMD_ATTACH     0x82  // sin payload → Slave attach ESC (resume PWM)
 
 // ============================================================================
 // PAQUETE DE TELEMETRÍA (26 bytes, enviado por SPI al ESP32)
@@ -159,6 +163,9 @@ static AS5600 as5600(&Wire);
 
 // --- ESC ---
 static bool escArmed = false;
+
+// --- ToF: flag para suprimir keepalive durante experimento ---
+static bool tofActive = false;
 
 // ============================================================================
 // ENCODER — ISR + cálculo RPM
@@ -436,6 +443,19 @@ static void escStop() {
     }
 }
 
+// Detach ESC: corta la señal PWM (el ESC deja de recibir comandos)
+static void escDetach() {
+    esc.detach();
+}
+
+// Re-attach ESC: reanuda la señal PWM (último valor escrito se mantiene)
+static void escAttach() {
+    if (escArmed) {
+        esc.attach(ESC_PIN);
+        esc.writeMicroseconds(ESC_NEUTRAL);
+    }
+}
+
 // ============================================================================
 // UART — COMUNICACIÓN MASTER ↔ SLAVE CON TIMEOUTS
 // ============================================================================
@@ -556,6 +576,16 @@ static void uartPoll() {
                         uartRxVal = 0;
                         uartRxReady = true;
                         break;
+                    case UART_CMD_DETACH:
+                        uartRxCmd = UART_CMD_DETACH;
+                        uartRxVal = 0;
+                        uartRxReady = true;
+                        break;
+                    case UART_CMD_ATTACH:
+                        uartRxCmd = UART_CMD_ATTACH;
+                        uartRxVal = 0;
+                        uartRxReady = true;
+                        break;
                     case UART_CMD_REQ_TELEM:
                         // Slave responde inmediatamente con sus datos
                         {
@@ -624,6 +654,14 @@ static void uartSendAC(uint16_t us) {
 
 static void uartSendStop() {
     Serial.write(UART_CMD_STOP);
+}
+
+static void uartSendDetach() {
+    Serial.write(UART_CMD_DETACH);
+}
+
+static void uartSendAttach() {
+    Serial.write(UART_CMD_ATTACH);
 }
 
 static void uartRequestSlaveTelem() {
@@ -701,6 +739,7 @@ static void processCommand(uint8_t cmd, int16_t val) {
             break;
 
         case SPI_CMD_STOP_ALL:
+            tofActive = false;
             motorSetPWM(0);
             escStop();
             slaveCmdDC = 0;           // Limpiar keepalive
@@ -708,16 +747,18 @@ static void processCommand(uint8_t cmd, int16_t val) {
             break;
 
         case SPI_CMD_TOF_ARM:
+            tofActive = true;
             escArmIfNeeded();
-            uartSendAC(ESC_NEUTRAL);  // Armar ESC del Slave también
             break;
 
         case SPI_CMD_TOF_START:
+            tofActive = true;
             escArmIfNeeded();
             escSetUS((uint16_t)val);
             break;
 
         case SPI_CMD_TOF_STOP:
+            tofActive = false;
             escStop();
             uartSendStop();  // Detener Slave también
             break;
@@ -725,6 +766,22 @@ static void processCommand(uint8_t cmd, int16_t val) {
         case SPI_CMD_TOF_FIRE_SLAVE:
             // Enviar valor ESC al Slave via UART (para ToF reverso)
             uartSendAC((uint16_t)val);
+            break;
+
+        case SPI_CMD_TOF_DETACH:
+            if (val == 0) {
+                escDetach();          // Detach local (Master)
+            } else {
+                uartSendDetach();     // Detach remoto (Slave via UART)
+            }
+            break;
+
+        case SPI_CMD_TOF_ATTACH:
+            if (val == 0) {
+                escAttach();          // Attach local (Master)
+            } else {
+                uartSendAttach();     // Attach remoto (Slave via UART)
+            }
             break;
 
         case SPI_CMD_ASK_ENCODER:
@@ -768,6 +825,14 @@ static void slaveProcessCommand() {
         case UART_CMD_STOP:
             motorSetPWM(0);
             escStop();
+            break;
+
+        case UART_CMD_DETACH:
+            escDetach();
+            break;
+
+        case UART_CMD_ATTACH:
+            escAttach();
             break;
 
         default:
@@ -828,8 +893,8 @@ void loop() {
             uartRequestSlaveTelem();
         }
 
-        // 3b. Keepalive: re-enviar actuación DC al Slave
-        if ((now - lastKeepalive) >= SLAVE_KEEPALIVE_MS) {
+        // 3b. Keepalive: re-enviar actuación DC al Slave (suprimido durante ToF)
+        if (!tofActive && (now - lastKeepalive) >= SLAVE_KEEPALIVE_MS) {
             lastKeepalive = now;
             uartSendDC(slaveCmdDC);
         }

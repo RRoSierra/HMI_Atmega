@@ -41,10 +41,9 @@ const TOF_ARM_DURATION_MS: u64 = 2000;
 const TOF_SILENCE_DURATION_MS: u64 = 1000;
 const TOF_PULSE_DURATION_MS: u64 = 50;
 const TOF_NEUTRAL_ESC: i16 = 1500;
-const TOF_PULSE_ESC: i16 = 2000;
 const TOF_LISTEN_TIMEOUT_MS: u64 = 3000;
-const TOF_MIN_DETECT_MS: u64 = 50;        // Mínimo tiempo post-firing antes de detectar
-const TOF_CONFIRM_THRESHOLD: usize = 3;   // Muestras consecutivas para confirmar detección
+const TOF_MIN_DETECT_MS: u64 = 0;
+const MIN_BASELINE_SAMPLES: usize = 3;
 const TOF_BUFFER_SIZE: usize = 1000;
 
 // ============================================================================
@@ -226,7 +225,9 @@ pub struct SysIdApp {
     tof_wavespeed: f64,
     tof_wave_detected: bool,
     tof_baseline: f64,
+    tof_baseline_shooter: f64,
     tof_baseline_samples: VecDeque<f64>,
+    tof_baseline_shooter_samples: VecDeque<f64>,
     tof_history: Vec<TofResult>,
     tof_times: VecDeque<f64>,
     tof_m_angle: VecDeque<f64>,
@@ -239,7 +240,8 @@ pub struct SysIdApp {
 
     // --- ToF Shooter Selection ---
     tof_shooter: TofShooter,
-    tof_confirm_count: usize,
+    tof_pulse_us: i16,
+
     tof_firing_time: Option<Instant>,
 
     // --- AS5600 Diagnostic ---
@@ -332,7 +334,9 @@ impl SysIdApp {
             tof_wavespeed: 0.0,
             tof_wave_detected: false,
             tof_baseline: 0.0,
+            tof_baseline_shooter: 0.0,
             tof_baseline_samples: VecDeque::new(),
+            tof_baseline_shooter_samples: VecDeque::new(),
             tof_history: Vec::new(),
             tof_times: VecDeque::with_capacity(TOF_BUFFER_SIZE),
             tof_m_angle: VecDeque::with_capacity(TOF_BUFFER_SIZE),
@@ -344,7 +348,7 @@ impl SysIdApp {
             tof_error_msg: None,
 
             tof_shooter: TofShooter::Master,
-            tof_confirm_count: 0,
+            tof_pulse_us: 2000,
             tof_firing_time: None,
 
             diag_data: None,
@@ -402,51 +406,77 @@ impl SysIdApp {
                         TOF_BUFFER_SIZE,
                     );
 
-                    // Feed baseline samples during Silence state
-                    if self.tof_state == TofState::Silence {
+                    // Feed baseline samples during Arming state (before firer ESC spins)
+                    // This ensures a clean baseline uncontaminated by firer vibration
+                    if self.tof_state == TofState::Arming {
                         let baseline_angle = match self.tof_shooter {
                             TofShooter::Master => pkt.s_angle, // Master dispara → baseline del sensor Slave
                             TofShooter::Slave => pkt.m_angle,  // Slave dispara → baseline del sensor Master
                         };
                         push_buf_sized(&mut self.tof_baseline_samples, baseline_angle as f64, 100);
+                        let shooter_angle = match self.tof_shooter {
+                            TofShooter::Master => pkt.m_angle, // Master fires → shooter is Master encoder
+                            TofShooter::Slave => pkt.s_angle,  // Slave fires → shooter is Slave encoder
+                        };
+                        push_buf_sized(&mut self.tof_baseline_shooter_samples, shooter_angle as f64, 100);
                     }
 
-                    // If listening, check for wave detection
-                    if self.tof_state == TofState::Listening && !self.tof_wave_detected {
+                    // Check for wave detection during Firing (short ropes) and Listening
+                    if (self.tof_state == TofState::Firing || self.tof_state == TofState::Listening) && !self.tof_wave_detected {
                         // Minimum time guard: skip detection for TOF_MIN_DETECT_MS after firing
                         let past_min_time = self.tof_firing_time.map_or(true, |ft| {
                             ft.elapsed() >= Duration::from_millis(TOF_MIN_DETECT_MS)
                         });
 
                         if past_min_time {
-                            let receiver_angle = match self.tof_shooter {
-                                TofShooter::Master => pkt.s_angle,  // Master dispara → detecta en Slave
-                                TofShooter::Slave => pkt.m_angle,   // Slave dispara → detecta en Master
-                            };
-                            let delta = (receiver_angle as f64 - self.tof_baseline).abs();
-                            if delta > self.tof_threshold {
-                                self.tof_confirm_count += 1;
-                                if self.tof_confirm_count >= TOF_CONFIRM_THRESHOLD {
-                                    self.tof_wave_detected = true;
-                                    self.tof_t1_ms = Some(pkt.timestamp_ms);
-                                    self.tof_tof_ms =
-                                        (pkt.timestamp_ms as i64 - self.tof_t0_ms.unwrap_or(0) as i64)
-                                            as f64;
-                                    self.tof_wavespeed =
-                                        self.tof_rope_length / (self.tof_tof_ms / 1000.0);
-                                    self.tof_t1_line = Some(tof_t);
-                                    self.tof_state = TofState::Done;
-
-                                    let ts = chrono::Local::now().format("%H:%M:%S").to_string();
-                                    self.tof_history.push(TofResult {
-                                        timestamp: ts,
-                                        target_hz: self.tof_target_hz,
-                                        tof_ms: self.tof_tof_ms,
-                                        wavespeed: self.tof_wavespeed,
-                                    });
+                            // 1. Detect shooter movement for true hardware T0
+                            // 1. Detectar el flanco de subida del disparador para el verdadero T0 físico
+                            if self.tof_t0_ms.is_none() {
+                                let shooter_angle = match self.tof_shooter {
+                                    TofShooter::Master => pkt.m_angle,
+                                    TofShooter::Slave => pkt.s_angle,
+                                };
+                                
+                                // CORRECCIÓN: Sin .abs() para asegurar que solo reacciona al empuje positivo
+                                let shooter_delta = shooter_angle as f64 - self.tof_baseline_shooter;
+                                
+                                if shooter_delta >= self.tof_threshold {
+                                    self.tof_t0_ms = Some(pkt.timestamp_ms);
+                                    self.tof_t0_line = Some(tof_t);
                                 }
-                            } else {
-                                self.tof_confirm_count = 0; // Reset on miss
+                            }
+
+                            // 2. Detect receiver impact for T1 (only after T0 is known)
+                            // 2. Detectar el impacto en el receptor para T1 (Solo después de T0)
+                            if let Some(t0_ms) = self.tof_t0_ms {
+                                // CORRECCIÓN: Filtro de > 0ms para evitar que ruido eléctrico dispare ambos en el mismo paquete
+                                if pkt.timestamp_ms > t0_ms {
+                                    let receiver_angle = match self.tof_shooter {
+                                        TofShooter::Master => pkt.s_angle,
+                                        TofShooter::Slave => pkt.m_angle,
+                                    };
+                                    
+                                    // CORRECCIÓN: Sin .abs() para ignorar el flanco de bajada / rebote mecánico
+                                    let delta = receiver_angle as f64 - self.tof_baseline;
+                                    
+                                    if delta >= self.tof_threshold {
+                                        self.tof_wave_detected = true;
+                                        self.tof_t1_ms = Some(pkt.timestamp_ms);
+                                        
+                                        self.tof_tof_ms = (pkt.timestamp_ms as i64 - t0_ms as i64) as f64;
+                                        self.tof_wavespeed = self.tof_rope_length / (self.tof_tof_ms / 1000.0);
+                                        self.tof_t1_line = Some(tof_t);
+                                        self.tof_state = TofState::Done;
+
+                                        let ts = chrono::Local::now().format("%H:%M:%S").to_string();
+                                        self.tof_history.push(TofResult {
+                                            timestamp: ts,
+                                            target_hz: self.tof_target_hz,
+                                            tof_ms: self.tof_tof_ms,
+                                            wavespeed: self.tof_wavespeed,
+                                        });
+                                    }
+                                }
                             }
                         }
                     }
@@ -680,23 +710,35 @@ impl SysIdApp {
                             self.tof_baseline = 0.0;
                         }
 
-                        if let Some(ref mut serial) = self.serial {
-                            let _ = serial.send_command(esc_spin_cmd, TOF_PULSE_ESC);
+                        let n_shooter = self.tof_baseline_shooter_samples.len();
+                        if n_shooter >= MIN_BASELINE_SAMPLES {
+                            let sum: f64 = self.tof_baseline_shooter_samples.iter().rev().take(5).sum();
+                            self.tof_baseline_shooter = sum / 5.0;
+                        } else if n_shooter > 0 {
+                            let sum: f64 = self.tof_baseline_shooter_samples.iter().sum();
+                            self.tof_baseline_shooter = sum / n_shooter as f64;
+                        } else {
+                            self.tof_baseline_shooter = self.tof_baseline_shooter_samples.front().copied().unwrap_or(0.0);
                         }
-                        self.tof_t0_ms = self.last_packet.as_ref().map(|p| p.timestamp_ms);
-                        self.tof_t0_line = self.tof_times.back().copied();
+
+                        if let Some(ref mut serial) = self.serial {
+                            let _ = serial.send_command(esc_spin_cmd, self.tof_pulse_us);
+                        }
                         self.tof_state = TofState::Firing;
                         self.tof_arm_time = Some(Instant::now());
                         self.tof_firing_time = Some(Instant::now());
-                        self.tof_confirm_count = 0;
                     }
                 }
             }
             TofState::Firing => {
                 if let Some(arm_time) = self.tof_arm_time {
                     if arm_time.elapsed() >= Duration::from_millis(TOF_PULSE_DURATION_MS) {
+                        let detach_firer: i16 = match self.tof_shooter {
+                            TofShooter::Master => 0,
+                            TofShooter::Slave => 1,
+                        };
                         if let Some(ref mut serial) = self.serial {
-                            let _ = serial.send_command(esc_spin_cmd, TOF_NEUTRAL_ESC);
+                            let _ = serial.send_command(CMD_TOF_DETACH, detach_firer);
                         }
                         self.tof_t1_sent = Some(Instant::now());
                         self.tof_state = TofState::Listening;
@@ -708,9 +750,15 @@ impl SysIdApp {
                     if t1_sent.elapsed() >= Duration::from_millis(TOF_LISTEN_TIMEOUT_MS) {
                         self.tof_tof_ms = 0.0;
                         self.tof_wavespeed = 0.0;
-                        self.tof_error_msg = Some(
-                            "Error: Timeout. Cuerda no detectada o señal muy débil.".to_string()
-                        );
+                        if self.tof_t0_ms.is_none() {
+                            self.tof_error_msg = Some(
+                                "Error: Disparador no detectado. Verificar encoder del motor.".to_string()
+                            );
+                        } else {
+                            self.tof_error_msg = Some(
+                                "Error: Timeout. Cuerda no detectada o señal muy débil.".to_string()
+                            );
+                        }
                         self.tof_state = TofState::Done;
                     }
                 }
@@ -724,7 +772,10 @@ impl SysIdApp {
             return;
         }
         if let Some(ref mut serial) = self.serial {
-            let _ = serial.send_command(CMD_TOF_ARM, 0);
+            match self.tof_shooter {
+                TofShooter::Master => { let _ = serial.send_command(CMD_TOF_ARM, 0); }
+                TofShooter::Slave => { let _ = serial.send_command(CMD_TOF_FIRE_SLAVE, TOF_NEUTRAL_ESC); }
+            }
         }
         self.tof_arm_time = Some(Instant::now());
         self.tof_armed = true;
@@ -736,6 +787,8 @@ impl SysIdApp {
         self.tof_t0_line = None;
         self.tof_t1_line = None;
         self.tof_baseline_samples.clear();
+        self.tof_baseline_shooter_samples.clear();
+        self.tof_baseline_shooter = 0.0;
         self.tof_error_msg = None;
         self.tof_state = TofState::Arming;
     }
@@ -743,13 +796,17 @@ impl SysIdApp {
     fn tof_stop(&mut self) {
         if let Some(ref mut serial) = self.serial {
             let _ = serial.send_command(CMD_TOF_STOP, 0);
+            let reattach_firer: i16 = match self.tof_shooter {
+                TofShooter::Master => 0,
+                TofShooter::Slave => 1,
+            };
+            let _ = serial.send_command(CMD_TOF_ATTACH, reattach_firer);
         }
         self.tof_state = TofState::Idle;
         self.tof_armed = false;
         self.tof_arm_time = None;
         self.tof_t1_sent = None;
         self.tof_firing_time = None;
-        self.tof_confirm_count = 0;
     }
 
     fn tof_reset(&mut self) {
@@ -758,7 +815,6 @@ impl SysIdApp {
         self.tof_arm_time = None;
         self.tof_t1_sent = None;
         self.tof_firing_time = None;
-        self.tof_confirm_count = 0;
         self.tof_wave_detected = false;
         self.tof_t0_ms = None;
         self.tof_t1_ms = None;
@@ -768,6 +824,8 @@ impl SysIdApp {
         self.tof_t1_line = None;
         self.tof_error_msg = None;
         self.tof_baseline_samples.clear();
+        self.tof_baseline_shooter_samples.clear();
+        self.tof_baseline_shooter = 0.0;
     }
 
     fn tof_export_csv(&self) {
@@ -1564,6 +1622,20 @@ impl SysIdApp {
                     {
                         self.tof_shooter = TofShooter::Slave;
                     }
+                });
+            });
+
+            ui.add_space(4.0);
+
+            let can_change_pulse = self.tof_state == TofState::Idle;
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Pulso (µs):").size(10.0).color(FG_DIM));
+                ui.add_enabled_ui(can_change_pulse, |ui| {
+                    ui.add(
+                        egui::Slider::new(&mut self.tof_pulse_us, 1000..=2000)
+                            .step_by(10.0)
+                            .suffix(" µs"),
+                    );
                 });
             });
 

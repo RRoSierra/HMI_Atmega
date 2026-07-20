@@ -1,0 +1,1 @@
+PASS: hardware T0 detection, reset logic, error message
